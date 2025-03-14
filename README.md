@@ -1,6 +1,10 @@
 # shaw-fixrec-demo
 # Post Interview Python Demo Project: FIX Reconciliation Script
 
+Version 1:
+Start TIME: 14:30 (Friday)
+End Time:
+
 ## Overview
 This tool identifies discrepancies between FIX message symbols and the security master database, with focus on detecting corporate action-related symbol changes that weren't properly updated in trading systems.
 
