@@ -1,0 +1,65 @@
+Minimum Viable Product (12-Hour Implementation):
+
+Rough guidlines to follow to allow for rapid deployment timeline.
+This is being done with a very aggresive timeline, so much of this will be refactored on the fly to achieve the results of producing viable code quickly. Primary goal is that it works, it's relevant and can be done in 12 hours.
+
+Functionality to Implement:
+
+Parse a simplified FIX log file (focus only on NewOrderSingle and Execution messages)
+Extract security identifiers (Symbol/55 and CUSIP/48)
+Compare against a CSV security master file
+Identify mismatches where CUSIP matches but symbol differs
+Calculate financial exposure (price * quantity) for each security
+Generate a CSV report with discrepancies and financial exposure metrics
+Data Sources
+Use sample FIX messages in text format (one message per line)
+Use a simple CSV for the security master with columns: Symbol, CUSIP, Description
+Implementation Guidelines
+
+Simplify the FIX Parser:
+
+
+Don't build a full FIX parser - just use regex to extract relevant tags
+Focus on Symbol (tag 55), SecurityID (tag 48), Quantity (tag 38), and Price (tag 44)
+Limit the Scope:
+
+
+Process only a small set of test messages (100-500 messages)
+Handle multiple regions and exchanges but focus on equities
+Include basic financial exposure calculations to show business impact
+
+Omit These Features for now:
+
+
+Real-time processing
+Complex error handling
+Performance optimization
+Authentication/security features
+Compliance reporting
+Data visualization
+Implementation Structure
+Your implementation should include these key components:
+Security Master Loader
+
+
+Load and index the security master file by multiple identifiers
+Handle different asset classes and regions
+FIX Message Parser
+
+
+Extract key fields including Symbol, CUSIP/SEDOL, Price, Quantity
+Handle both NewOrderSingle and ExecutionReport messages
+Discrepancy Analysis
+
+
+Find symbol mismatches based on security identifiers:
+
+Group issues by region and exchange
+Calculate financial exposure for each discrepancy
+Report Generation
+
+
+Create detailed CSV with all discrepancies:
+
+Include summary statistics with total financial impact
+Sort by financial exposure to highlight critical issues
