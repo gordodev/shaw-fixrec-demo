@@ -1,0 +1,17 @@
+Assets plan for project. This is all subject to change.
+
+main.py - Entry point that coordinates the workflow
+config.py - Configuration settings, CLI argument parsing
+data_models.py - Data structures for FIX messages and discrepancies
+secmaster.py - Loads and indexes security master data by CUSIP/symbol
+fix_parser.py - Parses FIX messages, extracts relevant fields
+analyzer.py - Identifies discrepancies, calculates financial exposure
+reporter.py - Generates CSV reports of discrepancies sorted by exposure
+utils.py - Helper functions and logging setup
+requirements.txt - Package dependencies
+
+Additional files:
+
+generate_test_data.py - Optional utility to create test data
+tests/test_parser.py - Basic unit tests
+tests/test_analyzer.py - Basic unit tests
