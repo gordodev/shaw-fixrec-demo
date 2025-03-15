@@ -4,10 +4,10 @@
 - [x] `config.py` → Define file paths, FIX message keys, and settings.  
 - [x] `models.py` → Create `SecurityMasterEntry`, `FixMessage`, etc. using `dataclasses`.  
 - [x] `security_master.py` → Load **Secmaster CSV**, index by `SecurityID/ISIN/CUSIP`.  
-- [ ] `fix_parser.py` → Read **FIX logs**, extract `Symbol`, `Price`, `Quantity`, etc.  
+- [x] `fix_parser.py` → Read **FIX logs**, extract `Symbol`, `Price`, `Quantity`, etc.  
 
 ### **2️⃣ Reconciliation Logic (3-4 hours)**
-- [ ] `analyzer.py` → Compare parsed FIX messages against Secmaster data.  
+- [x] `analyzer.py` → Compare parsed FIX messages against Secmaster data.  
 - [ ] `reporter.py` → Generate **CSV reports** showing mismatches & financial impact.  
 - [ ] `main.py` → Wire everything together, call the **parser → analyzer → reporter**.  
 
