@@ -12,7 +12,7 @@ Usage:
                    [--output OUTPUT_PATH] [--log-level {DEBUG,INFO,WARNING,ERROR}]
 
 Author: Carlyle
-Date: March 14, 2025
+Date: March 15, 2025
 """
 
 import os
@@ -26,11 +26,10 @@ from typing import Dict, List, Any, Tuple, Optional
 
 # Internal modules
 from config import load_config, setup_logging
-import models
 from fix_parser import FIXParser
 from analyzer import DiscrepancyAnalyzer
 from reporter import DiscrepancyReporter
-from sec_master import SecurityMasterLoader
+from security_master import load_security_master
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -41,7 +40,7 @@ def parse_arguments() -> argparse.Namespace:
                        help="Path to security master CSV file")
     
     parser.add_argument("--fix-log", 
-                       help="Path to FIX message log file")
+                       help="Path to FIX log file")
     
     parser.add_argument("--output", 
                        help="Path to output report file")
@@ -56,7 +55,7 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_security_master(secmaster_path: str) -> Dict[str, Dict[str, Any]]:
+def load_security_master_data(secmaster_path: str) -> Dict[str, Dict[str, Any]]:
     """
     Load and index the security master file.
     
@@ -73,18 +72,27 @@ def load_security_master(secmaster_path: str) -> Dict[str, Dict[str, Any]]:
     logger = logging.getLogger(__name__)
     logger.info(f"Loading security master from: {secmaster_path}")
     
-    loader = SecurityMasterLoader()
-    security_master = loader.load_from_csv(secmaster_path)
+    # Use the load_security_master function from security_master.py
+    sec_master = load_security_master(secmaster_path)
     
-    logger.info(f"Loaded {len(security_master)} securities from master file")
+    if not sec_master.is_loaded():
+        logger.error(f"Failed to load security master from: {secmaster_path}")
+        raise ValueError(f"Failed to load security master from: {secmaster_path}")
+    
+    # Convert SecurityMaster object's data to the format needed by the analyzer
+    security_data = {}
+    for cusip, security in sec_master.securities.items():
+        security_data[cusip] = security
+    
+    logger.info(f"Loaded {len(security_data)} securities from master file")
     
     # Log some stats about the security master
-    regions = set(sec.get('Region', 'Unknown') for sec in security_master.values())
-    exchanges = set(sec.get('Exchange', 'Unknown') for sec in security_master.values())
+    regions = set(sec.get('Region', 'Unknown') for sec in security_data.values() if 'Region' in sec)
+    exchanges = set(sec.get('Exchange', 'Unknown') for sec in security_data.values() if 'Exchange' in sec)
     
     logger.info(f"Security master covers {len(regions)} regions and {len(exchanges)} exchanges")
     
-    return security_master
+    return security_data
 
 
 def parse_fix_log(fix_log_path: str, delimiter: str = "|") -> List[Dict[str, Any]]:
@@ -113,7 +121,21 @@ def parse_fix_log(fix_log_path: str, delimiter: str = "|") -> List[Dict[str, Any
                f"{stats['new_order_singles']} new orders, "
                f"{stats['execution_reports']} execution reports")
     
-    return [msg.__dict__ for msg in messages]  # Convert to dicts for analyzer
+    # Convert FIXMessage objects to dictionaries for analyzer
+    message_dicts = []
+    for msg in messages:
+        msg_dict = {
+            'msg_type': msg.msg_type,
+            'Symbol': msg.symbol,
+            'CUSIP': msg.cusip,
+            'Quantity': msg.quantity,
+            'Price': msg.price,
+            'message_id': msg.message_id,
+            'order_id': msg.order_id
+        }
+        message_dicts.append(msg_dict)
+    
+    return message_dicts
 
 
 def analyze_fix_messages(fix_messages: List[Dict[str, Any]], 
@@ -197,7 +219,7 @@ def run(config: Dict[str, Any]) -> int:
     
     try:
         # Step 1: Load security master
-        security_master = load_security_master(config['secmaster_path'])
+        security_master = load_security_master_data(config['secmaster_path'])
         
         # Step 2: Parse FIX log
         fix_messages = parse_fix_log(config['fix_log_path'], config['fix_delimiter'])
@@ -278,6 +300,12 @@ def main() -> int:
     try:
         # Configure the application
         config = configure()
+        
+        # Validate required configuration settings
+        for required in ['secmaster_path', 'fix_log_path', 'output_path']:
+            if not config.get(required):
+                print(f"Error: Missing required configuration: {required}")
+                return 1
         
         # Display configuration for audit
         print(f"Security Master: {config['secmaster_path']}")
