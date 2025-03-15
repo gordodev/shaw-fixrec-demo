@@ -1,7 +1,7 @@
 ## **📌 Development Order **
 
 ### **1️⃣ Setup & Core Framework (1-2 hours)**
-- [ ] `config.py` → Define file paths, FIX message keys, and settings.  
+- [x] `config.py` → Define file paths, FIX message keys, and settings.  
 - [ ] `models.py` → Create `SecurityMasterEntry`, `FixMessage`, etc. using `dataclasses`.  
 - [ ] `security_master.py` → Load **Secmaster CSV**, index by `SecurityID/ISIN/CUSIP`.  
 - [ ] `fix_parser.py` → Read **FIX logs**, extract `Symbol`, `Price`, `Quantity`, etc.  
