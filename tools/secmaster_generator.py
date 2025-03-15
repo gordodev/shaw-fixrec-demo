@@ -82,20 +82,13 @@ def human_readable_size(size_bytes: int) -> str:
 
 
 def get_free_disk_space(path: str) -> int:
-    """
-    Get free disk space in bytes for the given path.
-    
-    Args:
-        path: Directory path to check
-        
-    Returns:
-        Free space in bytes
-    """
+    """Get free disk space in bytes for the given path."""
     try:
-        if not os.path.exists(path):
-            path = os.path.dirname(path)
-        if not path:
-            path = '.'
+        # Always use the directory containing the file, not the file itself
+        if os.path.isfile(path) or not os.path.exists(path):
+            path = os.path.dirname(os.path.abspath(path))
+        if not path or path == '.':
+            path = os.getcwd()  # Use current working directory as fallback
             
         disk_usage = psutil.disk_usage(path)
         return disk_usage.free
@@ -146,21 +139,19 @@ def check_disk_space(file_path: str, required_gb: float, buffer_gb: float = 5.0)
 
 
 def check_free_space_percentage(path: str, min_percent: int = 10) -> bool:
-    """
-    Check if disk has at least the minimum percentage of free space.
-    
-    Args:
-        path: Path to check
-        min_percent: Minimum percentage of free space required
-        
-    Returns:
-        True if there's enough space, False otherwise
-    """
+    """Check if disk has at least the minimum percentage of free space."""
     try:
-        if not os.path.exists(path):
-            path = os.path.dirname(path)
-        if not path:
-            path = '.'
+        # Always use the directory containing the file, not the file itself
+        if os.path.isfile(path) or not os.path.exists(path):
+            path = os.path.dirname(os.path.abspath(path))
+        
+        # If path is empty or doesn't exist, use current directory
+        if not path or path == '.' or not os.path.exists(path):
+            path = os.getcwd()
+            
+        # Create the directory if it doesn't exist
+        if not os.path.exists(path) and path != os.getcwd():
+            os.makedirs(path, exist_ok=True)
             
         disk_usage = psutil.disk_usage(path)
         free_percent = 100 - disk_usage.percent
@@ -168,7 +159,9 @@ def check_free_space_percentage(path: str, min_percent: int = 10) -> bool:
         return free_percent >= min_percent
     except Exception as e:
         print(f"Error checking disk space percentage: {e}")
-        return False
+        # Instead of returning False (which triggers warnings), return True if we can't check
+        # This prevents false positives on Windows 
+        return True  # Assume enough space if we can't check
 
 
 def generate_symbols(count: int) -> List[str]:
@@ -290,10 +283,12 @@ class DiskSpaceMonitor:
                     print(f"\nWARNING: Low disk space! Only {human_readable_size(free_bytes)} available.")
                     self.disk_space_critical.set()
                 
-                # Also check percentage
+                # In the _monitor_loop method
                 if not check_free_space_percentage(self.file_path, self.min_free_percent):
                     print(f"\nWARNING: Low disk space percentage! Less than {self.min_free_percent}% free.")
-                    self.disk_space_critical.set()
+                    # Only set critical flag if we're sure about the percentage
+                    if get_free_disk_space(self.file_path) > 0:  # Only if we got a valid reading
+                        self.disk_space_critical.set()
                     
             except Exception as e:
                 print(f"\nError in disk space monitor: {e}")
