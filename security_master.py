@@ -4,7 +4,7 @@ Security Master Data Loader
 
 This module handles loading and indexing security master data from CSV files.
 It provides efficient lookup by various identifiers (CUSIP, Symbol) 
-
+Author: Carlyle
 """
 
 import os
