@@ -65,10 +65,11 @@ class DiscrepancyReporter:
             self._write_empty_report()
             return
             
-        # Sort discrepancies by exposure (highest first)
+        # Sort discrepancies by Exposure (highest first)
+        # Note: analyzer.py uses 'Exposure' with capital E
         sorted_discrepancies = sorted(
             discrepancies, 
-            key=lambda x: x.get('exposure', 0), 
+            key=lambda x: x.get('Exposure', 0), 
             reverse=True
         )
         
@@ -103,7 +104,7 @@ class DiscrepancyReporter:
                 
                 # Add statistics on highest exposure items
                 if len(discrepancies) >= 3:
-                    top_three = sum(d.get('exposure', 0) for d in discrepancies[:3])
+                    top_three = sum(d.get('Exposure', 0) for d in discrepancies[:3])
                     top_three_pct = (top_three / total_exposure) * 100 if total_exposure else 0
                     csvfile.write(f"# Top 3 Items Represent: ${top_three:,.2f} ({top_three_pct:.1f}% of total exposure)\n")
 
@@ -210,10 +211,11 @@ class BasicDiscrepancyReporter(DiscrepancyReporter):
                 csvfile.write("# No Symbol Discrepancies Found\n")
                 return
             
-        # Sort discrepancies by exposure (highest first)
+        # Sort discrepancies by Exposure (highest first)
+        # Note: analyzer.py uses 'Exposure' with capital E
         sorted_discrepancies = sorted(
             discrepancies, 
-            key=lambda x: x.get('exposure', 0), 
+            key=lambda x: x.get('Exposure', 0), 
             reverse=True
         )
         
