@@ -8,8 +8,8 @@
 
 ### **2️⃣ Reconciliation Logic (3-4 hours)**
 - [x] `analyzer.py` → Compare parsed FIX messages against Secmaster data.  
-- [ ] `reporter.py` → Generate **CSV reports** showing mismatches & financial impact.  
-- [ ] `main.py` → Wire everything together, call the **parser → analyzer → reporter**.  
+- [x] `reporter.py` → Generate **CSV reports** showing mismatches & financial impact.  
+- [x] `main.py` → Wire everything together, call the **parser → analyzer → reporter**.  
 
 ### **3️⃣ Logging, Error Handling, & Security (1-2 hours)**
 - [ ] `logging_config.py` → Setup **structured logs** for debugging.  
