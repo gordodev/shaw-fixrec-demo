@@ -1,8 +1,8 @@
-CUSIP,MasterSymbol,FIXSymbol,Quantity,Price,Exposure,Exchange,Region,Asset Class,Currency
-0333100,MALLFORMED,AAPL,1000.0,142.15,142150.0,UNKNOWN,US,Equity,USD
+CUSIP,MasterSymbol,FIXSymbol,Quantity,Price,Exposure,Exchange,Region
+0333100,MALLFORMED,AAPL,1000.0,142.15,142150.0,UNKNOWN,US
 
 # Report Summary
-# Generated: 2025-03-15 16:29:12
+# Generated: 2025-03-16 17:35:17
 # Total Discrepancies: 1
 # Total Financial Exposure: $142,150.00
-# Report ID: FIXREC-20250315162912
+# Report ID: FIXREC-20250316173517
