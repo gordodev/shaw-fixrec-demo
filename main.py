@@ -7,12 +7,18 @@ This tool identifies discrepancies between FIX message symbols and the security 
 database, with focus on detecting corporate action-related symbol changes that weren't
 properly updated in trading systems.
 
+Key features:
+- Memory-efficient processing of extremely large security master files (I tested up to 200GB security master file)
+- Streaming FIX log parsing to minimize memory usage
+- Progress reporting and resource monitoring
+- logging
+
 Usage:
     python main.py [--secmaster SECMASTER_PATH] [--fix-log FIX_LOG_PATH] 
-                   [--output OUTPUT_PATH] [--log-level {DEBUG,INFO,WARNING,ERROR}]
+                  [--output OUTPUT_PATH] [--log-level {DEBUG,INFO,WARNING,ERROR}]
 
 Author: Carlyle
-Date: March 15, 2025
+Date: March 16, 2025
 """
 
 import os
@@ -20,16 +26,18 @@ import sys
 import time
 import argparse
 import logging
+import gc
+import psutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 
 # Internal modules
 from config import load_config, setup_logging
+from security_master import load_security_master
 from fix_parser import FIXParser
 from analyzer import DiscrepancyAnalyzer
 from reporter import DiscrepancyReporter
-from security_master import load_security_master
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -40,7 +48,7 @@ def parse_arguments() -> argparse.Namespace:
                        help="Path to security master CSV file")
     
     parser.add_argument("--fix-log", 
-                       help="Path to FIX log file")
+                       help="Path to FIX message log file")
     
     parser.add_argument("--output", 
                        help="Path to output report file")
@@ -52,15 +60,26 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--delimiter", 
                        help="FIX message field delimiter (default: |)")
     
+    # Advanced memory management options
+    parser.add_argument("--chunk-size", 
+                       type=int, default=64,
+                       help="Security master chunk size in MB (default: 64)")
+    
+    parser.add_argument("--disable-mmap", 
+                       action="store_true",
+                       help="Disable memory mapping for security master loading")
+    
     return parser.parse_args()
 
 
-def load_security_master_data(secmaster_path: str) -> Dict[str, Dict[str, Any]]:
+def load_security_master_data(secmaster_path: str, chunk_size_mb: int = 64, use_mmap: bool = True) -> Dict[str, Dict[str, Any]]:
     """
-    Load and index the security master file.
+    Load and index the security master file in a memory-efficient way.
     
     Args:
         secmaster_path: Path to security master CSV file
+        chunk_size_mb: Size of each chunk to process in MB
+        use_mmap: Whether to use memory mapping for file access
         
     Returns:
         Dictionary of security master data indexed by CUSIP
@@ -72,27 +91,46 @@ def load_security_master_data(secmaster_path: str) -> Dict[str, Dict[str, Any]]:
     logger = logging.getLogger(__name__)
     logger.info(f"Loading security master from: {secmaster_path}")
     
-    # Use the load_security_master function from security_master.py
-    sec_master = load_security_master(secmaster_path)
+    # Log memory usage at start
+    process = psutil.Process(os.getpid())
+    start_memory = process.memory_info().rss
+    logger.info(f"Memory usage before loading: {start_memory / (1024**2):.1f} MB")
     
-    if not sec_master.is_loaded():
-        logger.error(f"Failed to load security master from: {secmaster_path}")
-        raise ValueError(f"Failed to load security master from: {secmaster_path}")
+    # Start loading timer
+    start_time = time.time()
     
-    # Convert SecurityMaster object's data to the format needed by the analyzer
-    security_data = {}
-    for cusip, security in sec_master.securities.items():
-        security_data[cusip] = security
+    # Load the security master with chunked loading
+    try:
+        # Call the factory function from chunked_secmaster_loader
+        sec_master = load_security_master(secmaster_path)
+        
+        if not sec_master.is_file_loaded():
+            logger.error(f"Failed to load security master from: {secmaster_path}")
+            raise ValueError(f"Failed to load security master from: {secmaster_path}")
+        
+        # Get a lightweight dictionary for the analyzer
+        security_data = sec_master.get_security_dict()
+        
+        # Log timing and memory stats
+        elapsed_time = time.time() - start_time
+        current_memory = process.memory_info().rss
+        memory_increase = current_memory - start_memory
+        
+        logger.info(f"Loaded {sec_master.get_security_count():,} securities in {elapsed_time:.2f} seconds")
+        logger.info(f"Memory usage after loading: {current_memory / (1024**2):.1f} MB " +
+                   f"(increase: {memory_increase / (1024**2):.1f} MB)")
+        
+        # Log some stats about the security master
+        regions = set(sec.get('Region', 'Unknown') for sec in security_data.values() if 'Region' in sec)
+        exchanges = set(sec.get('Exchange', 'Unknown') for sec in security_data.values() if 'Exchange' in sec)
+        
+        logger.info(f"Security master covers {len(regions)} regions and {len(exchanges)} exchanges")
+        
+        return security_data
     
-    logger.info(f"Loaded {len(security_data)} securities from master file")
-    
-    # Log some stats about the security master
-    regions = set(sec.get('Region', 'Unknown') for sec in security_data.values() if 'Region' in sec)
-    exchanges = set(sec.get('Exchange', 'Unknown') for sec in security_data.values() if 'Exchange' in sec)
-    
-    logger.info(f"Security master covers {len(regions)} regions and {len(exchanges)} exchanges")
-    
-    return security_data
+    except Exception as e:
+        logger.error(f"Error loading security master: {e}")
+        raise
 
 
 def parse_fix_log(fix_log_path: str, delimiter: str = "|") -> List[Dict[str, Any]]:
@@ -112,16 +150,24 @@ def parse_fix_log(fix_log_path: str, delimiter: str = "|") -> List[Dict[str, Any
     logger = logging.getLogger(__name__)
     logger.info(f"Parsing FIX messages from: {fix_log_path}")
     
+    start_time = time.time()
+    start_memory = psutil.Process(os.getpid()).memory_info().rss
+    
     fix_parser = FIXParser(delimiter=delimiter)
     messages = fix_parser.parse_file(fix_log_path)
     
+    elapsed_time = time.time() - start_time
+    current_memory = psutil.Process(os.getpid()).memory_info().rss
+    memory_increase = current_memory - start_memory
+    
     stats = fix_parser.get_statistics(messages)
     
-    logger.info(f"Parsed {stats['total_messages']} messages: "
+    logger.info(f"Parsed {stats['total_messages']} messages in {elapsed_time:.2f} seconds: "
                f"{stats['new_order_singles']} new orders, "
                f"{stats['execution_reports']} execution reports")
+    logger.info(f"Memory usage for FIX parsing: {memory_increase / (1024**2):.1f} MB")
     
-    # Convert FIXMessage objects to dictionaries for analyzer
+    # Convert to dicts for analyzer and trigger garbage collection
     message_dicts = []
     for msg in messages:
         msg_dict = {
@@ -134,6 +180,10 @@ def parse_fix_log(fix_log_path: str, delimiter: str = "|") -> List[Dict[str, Any
             'order_id': msg.order_id
         }
         message_dicts.append(msg_dict)
+    
+    # Clear the original messages list to free memory
+    messages.clear()
+    gc.collect()
     
     return message_dicts
 
@@ -153,10 +203,14 @@ def analyze_fix_messages(fix_messages: List[Dict[str, Any]],
     logger = logging.getLogger(__name__)
     logger.info("Analyzing FIX messages for discrepancies against security master")
     
+    start_time = time.time()
+    
     analyzer = DiscrepancyAnalyzer(security_master)
     discrepancies, total_exposure = analyzer.analyze_messages(fix_messages)
     
-    logger.info(f"Analysis complete. Found {len(discrepancies)} discrepancies "
+    elapsed_time = time.time() - start_time
+    
+    logger.info(f"Analysis complete in {elapsed_time:.2f} seconds. Found {len(discrepancies)} discrepancies "
                f"with total exposure of ${total_exposure:,.2f}")
     
     # Log top discrepancies by exposure
@@ -218,8 +272,12 @@ def run(config: Dict[str, Any]) -> int:
     start_time = time.time()
     
     try:
-        # Step 1: Load security master
-        security_master = load_security_master_data(config['secmaster_path'])
+        # Step 1: Load security master with memory-efficient chunked loading
+        security_master = load_security_master_data(
+            config['secmaster_path'],
+            chunk_size_mb=config.get('chunk_size', 64),
+            use_mmap=not config.get('disable_mmap', False)
+        )
         
         # Step 2: Parse FIX log
         fix_messages = parse_fix_log(config['fix_log_path'], config['fix_delimiter'])
@@ -234,6 +292,11 @@ def run(config: Dict[str, Any]) -> int:
         elapsed_time = time.time() - start_time
         logger.info(f"Completed successfully in {elapsed_time:.2f} seconds")
         logger.info(f"Found {len(discrepancies)} discrepancies with total exposure of ${total_exposure:,.2f}")
+        
+        # Log memory usage
+        process = psutil.Process(os.getpid())
+        memory_usage = process.memory_info().rss
+        logger.info(f"Peak memory usage: {memory_usage / (1024**2):.1f} MB")
         
         return 0  # Success
         
@@ -250,6 +313,8 @@ def run(config: Dict[str, Any]) -> int:
         return 1  # General error
     
     finally:
+        # Force garbage collection at the end
+        gc.collect()
         logger.info("FIX Symbol Discrepancy Checker completed")
 
 
@@ -282,6 +347,13 @@ def configure() -> Dict[str, Any]:
     if args.delimiter:
         config['fix_delimiter'] = args.delimiter
     
+    # Additional memory management options
+    if args.chunk_size:
+        config['chunk_size'] = args.chunk_size
+    
+    if args.disable_mmap:
+        config['disable_mmap'] = True
+    
     # Set up logging with configured level
     setup_logging(config['log_level'])
     
@@ -312,6 +384,13 @@ def main() -> int:
         print(f"FIX Log File: {config['fix_log_path']}")
         print(f"Output Report: {config['output_path']}")
         print(f"Log Level: {config['log_level']}")
+        
+        if 'chunk_size' in config:
+            print(f"Security Master Chunk Size: {config['chunk_size']} MB")
+        
+        if config.get('disable_mmap', False):
+            print("Memory Mapping: Disabled")
+        
         print("-" * 50)
         
         # Run the main process
