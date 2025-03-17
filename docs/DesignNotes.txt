@@ -38,26 +38,22 @@ Authentication/security features
 Compliance reporting
 Data visualization
 Implementation Structure
-Your implementation should include these key components:
-Security Master Loader
 
+Security Master Loader
 
 Load and index the security master file by multiple identifiers
 Handle different asset classes and regions
 FIX Message Parser
 
-
 Extract key fields including Symbol, CUSIP/SEDOL, Price, Quantity
 Handle both NewOrderSingle and ExecutionReport messages
 Discrepancy Analysis
-
 
 Find symbol mismatches based on security identifiers:
 
 Group issues by region and exchange
 Calculate financial exposure for each discrepancy
 Report Generation
-
 
 Create detailed CSV with all discrepancies:
 

@@ -1,0 +1,9 @@
+# Pre-market symbol discrepancy checks for NYSE trading days
+30 6 * * 1-5 /usr/bin/python3 /path/to/main.py \
+  --secmaster /data/security_master.csv \
+  --fix-log /logs/pre_market_orders.log \
+  --output /reports/pre_market_discrepancies.csv \
+  --log-level INFO
+
+# Email report to ref data team using deshaw domain
+35 6 * * 1-5 /usr/bin/mail -s "Pre-Market Symbol Discrepancies" refdata@deshaw.com < /reports/pre_market_discrepancies.csv
