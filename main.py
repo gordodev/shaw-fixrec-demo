@@ -799,12 +799,14 @@ def run(config: Dict[str, Any]) -> int:
         gc.collect()
         
         # Step 2: Parse FIX log
+        print ("Starting to parse FIX")
         fix_messages = parse_fix_log(
             config['fix_log_path'], 
             config['fix_delimiter'],
             resource_monitor=resource_monitor
         )
-        
+        print ("resource_monitor next")
+
         # Step 3: Analyze messages for discrepancies
         discrepancies, total_exposure = analyze_fix_messages(
             fix_messages, 
