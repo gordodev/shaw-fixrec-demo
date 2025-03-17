@@ -90,6 +90,9 @@ I'm currently working on:
 - Further tuning thread allocation based on system resources
 - More granular memory usage controls
 - Adaptive chunk sizing based on available system resources
+- Pandas optimizations:
+-     Only load fields that are needed
+-     Define fields efficiently (specify range of variability and identify limited fields like catagories)
 
 ## Lessons Learned
 
