@@ -11,8 +11,13 @@ Features:
 - Streaming line-by-line processing to minimize memory footprint
 - Memory-efficient data types (float32 instead of float64)
 - Selective field extraction (ignores irrelevant FIX fields)
-- Resource monitoring with automatic throttling
 - Optimized for handling extremely large files (60GB+)
+
+Pushing the performance envelope a bit more before doing rapid QA, then UAT deployment stage
+
+NOTE: This code has been build to be PROD friendly, not actually PROD ready. Trying to see how far we can push it, in a short period of time
+      strickly as a demonstration of my skills and abilities. PROD version of this, would take a lot more time and be much more complex,
+      and would need EXTENSIVE testing and QA before deployment. PROD must be done with caution and care, and with a lot of testing. Financial risks are too high to do otherwise.
 
 Author: Carlyle
 Date: March 17, 2025
