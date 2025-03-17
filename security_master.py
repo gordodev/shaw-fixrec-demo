@@ -400,7 +400,9 @@ class ChunkedSecurityMasterLoader:
                 self.resource_monitor.stop()
             if self.thread_pool:
                 self.thread_pool.shutdown(wait=False)
+            print ("Taking out the garbage next")
             gc.collect()
+            print ("garbage tossed")
 
         self._is_file_loaded = success
         return success
