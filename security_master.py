@@ -954,21 +954,57 @@ class ChunkedSecurityMasterLoader:
             return (False, expected_symbol)
     
     def get_security_dict(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get a lightweight dictionary suitable for the analyzer.
-        
-        This creates a minimal representation needed by the analyzer
-        without loading all record details into memory.
-        
-        Returns:
-            Dictionary mapping CUSIPs to minimal security records
-        """
-        if not self.is_loaded:
-            logger.warning("Attempted to get security dict before security master was loaded")
-            return {}
+            """
+            Get a lightweight dictionary suitable for the analyzer.
             
-        # Get a thread-safe snapshot of the indices
-        return self.indices.get_dict_snapshot()
+            This creates a minimal representation needed by the analyzer
+            without loading all record details into memory.
+            
+            Returns:
+                Dictionary mapping CUSIPs to minimal security records
+            """
+            if not self.is_loaded:
+                logger.warning("Attempted to get security dict before security master was loaded")
+                return {}
+                
+            # Build a lightweight dictionary with just the Symbol and critical grouping fields
+            security_dict = {}
+            essential_fields = ['Symbol', 'Region', 'Exchange']
+            
+            # Process each CUSIP in batches to manage memory
+            cusips = list(self.cusip_index.keys())
+            batch_size = min(10000, len(cusips))
+            
+            # Pre-compute field indices for direct access
+            field_indices = {field: self.header.get(field, -1) for field in essential_fields}
+            
+            for i in range(0, len(cusips), batch_size):
+                batch = cusips[i:i+batch_size]
+                
+                for cusip in batch:
+                    try:
+                        # Directly extract only essential fields using column indices
+                        # instead of loading the entire record into memory
+                        with open(self.file_path, 'r', newline='') as f:
+                            position = self.cusip_index[cusip]
+                            f.seek(position)
+                            line = f.readline().strip()
+                            
+                            # Parse the CSV line
+                            values = next(csv.reader([line]))
+                            
+                            # Extract only the essential fields by index
+                            security_dict[cusip] = {}
+                            for field, idx in field_indices.items():
+                                if idx >= 0 and idx < len(values):
+                                    security_dict[cusip][field] = values[idx]
+                    except Exception as e:
+                        logger.warning(f"Error retrieving data for CUSIP {cusip}: {e}")
+                
+                # Release memory after each batch
+                gc.collect()
+                
+            return security_dict
     
     def get_securities_by_region(self, region: str) -> List[Dict[str, Any]]:
         """
