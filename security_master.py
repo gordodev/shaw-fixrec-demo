@@ -37,6 +37,8 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from threading import Lock
 
+# Constants for chunked processing
+DEFAULT_CHUNK_SIZE_MB = 64  # Default chunk size in MB
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -311,29 +313,13 @@ class ThreadSafeIndices:
 
 
 class ChunkedSecurityMasterLoader:
-    """
-    Memory-efficient security master loader that processes files in chunks
-    using multiple threads for improved performance.
-    
-    This class allows processing extremely large security master files
-    without loading the entire file into memory at once. It builds indexes
-    incrementally and provides streaming access to the data.
-    """
-    
     def __init__(self, config: Optional[SecurityMasterConfig] = None):
-        """
-        Initialize the chunked loader.
-        
-        Args:
-            config: Configuration options (or None for defaults)
-        """
         self.config = config or SecurityMasterConfig()
         self.indices = ThreadSafeIndices()
-        
         self.file_path = None
         self.file_size = 0
         self.header = {}
-        self.is_loaded = False
+        self._is_file_loaded = False
         self.resource_monitor = None
         self.processed_rows = 0
         self.total_rows = 0
@@ -341,30 +327,22 @@ class ChunkedSecurityMasterLoader:
         self.thread_pool = None
         self.job_queue = Queue(maxsize=self.config.max_queue_size)
         self.result_lock = threading.Lock()
-        
+        self.file = None  # Add file handle reference
+
     def load(self, file_path: str) -> bool:
-        """
-        Load security master from file and build indexes using multiple threads.
-        
-        Args:
-            file_path: Path to security master CSV file
-            
-        Returns:
-            True if successful, False otherwise
-        """
+        """Main entry point for loading the security master file."""
         self.file_path = file_path
         self.start_time = time.time()
-        
+        success = False
+
         try:
-            # Check if file exists
             if not os.path.exists(file_path):
                 logger.error(f"Security master file not found: {file_path}")
                 return False
-                
-            # Get file size
+
             self.file_size = os.path.getsize(file_path)
             logger.info(f"Loading security master from {file_path} ({self._format_file_size(self.file_size)})")
-            
+
             # Initialize resource monitor
             self.resource_monitor = ResourceMonitor(
                 cpu_threshold=self.config.cpu_threshold_pct,
@@ -372,639 +350,207 @@ class ChunkedSecurityMasterLoader:
                 adaptative=self.config.adaptative_threading
             )
             self.resource_monitor.start()
-            
-            # Process file in chunks using multiple threads
-            if self.config.enable_mmap and self.file_size > 0:
-                # Use memory mapping for faster access with chunking
-                success = self._process_with_mmap_threaded()
-            else:
-                # Fall back to regular file reading
-                success = self._process_with_reader_threaded()
-                
-            if success:
-                self.is_loaded = True
-                
-                # Log processing stats
-                elapsed = time.time() - self.start_time
-                logger.info(f"Successfully indexed {self.indices.get_cusip_count():,} securities "
-                           f"in {elapsed:.2f} seconds")
-                logger.info(f"Found {len(self.indices.get_regions())} regions and "
-                           f"{len(self.indices.get_exchanges())} exchanges")
-                
-                # Log peak resource usage
-                peak_memory, peak_memory_pct, peak_cpu = self.resource_monitor.get_peak_usage()
-                logger.info(f"Peak memory usage: {self._format_bytes(peak_memory)} ({peak_memory_pct:.1f}%)")
-                logger.info(f"Peak CPU usage: {peak_cpu:.1f}%")
-                
-                return True
-            
-            return False
-            
+
+            # Open file with appropriate mode
+            file_mode = 'r' if self.config.enable_mmap else 'rb'
+            with open(file_path, file_mode) as self.file:
+                # Memory map the file if enabled
+                if self.config.enable_mmap:
+                    mm = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+                    content = mm.read().decode('utf-8')
+                    mm.close()
+                else:
+                    content = self.file.read()
+
+                # Read CSV header
+                csv_reader = csv.reader(content.splitlines())
+                self.header = {name: idx for idx, name in enumerate(next(csv_reader))}
+
+                # Prepare for chunked processing
+                chunk_size_bytes = self.config.chunk_size_mb * 1024 * 1024
+                self.thread_pool = ThreadPoolExecutor(max_workers=self.config.thread_count)
+
+                # Process chunks
+                chunk = []
+                current_chunk_size = 0
+                for row in csv_reader:
+                    chunk.append(row)
+                    current_chunk_size += sum(len(field) for field in row)
+
+                    if current_chunk_size >= chunk_size_bytes:
+                        self._submit_chunk(chunk)
+                        chunk = []
+                        current_chunk_size = 0
+
+                # Process remaining rows
+                if chunk:
+                    self._submit_chunk(chunk)
+
+                # Wait for completion
+                self.thread_pool.shutdown(wait=True)
+
+            success = True
+            logger.info(f"Successfully loaded {self.indices.get_cusip_count():,} securities")
+
         except Exception as e:
-            logger.error(f"Failed to load security master: {e}")
+            logger.error(f"Failed to load security master: {str(e)}", exc_info=True)
             return False
         finally:
-            # Clean up resources
             if self.resource_monitor:
                 self.resource_monitor.stop()
-                self.resource_monitor = None
-                
-            # Clean up thread pool if it exists
             if self.thread_pool:
-                self.thread_pool.shutdown(wait=True)
-                self.thread_pool = None
-                
-            # Force garbage collection
+                self.thread_pool.shutdown(wait=False)
             gc.collect()
-    
-    def _process_chunk(self, chunk_data: Tuple[bytes, int, Dict[str, int]]) -> int:
-        """
-        Process a chunk of data from the security master file.
-        
-        Args:
-            chunk_data: Tuple of (data, offset, header_indices)
-            
-        Returns:
-            Number of rows processed
-        """
-        data, offset, header_indices = chunk_data
-        rows_processed = 0
-        
-        # Get header indices for fields we care about
-        cusip_idx = header_indices.get('CUSIP', -1)
-        symbol_idx = header_indices.get('Symbol', -1)
-        region_idx = header_indices.get('Region', -1)
-        exchange_idx = header_indices.get('Exchange', -1)
-        
-        # Check if we have the minimum required indices
-        if cusip_idx < 0 or symbol_idx < 0:
-            logger.error("Missing required columns in header")
-            return 0
-        
-        # Split data into lines
-        lines = data.split(b'\n')
-        line_offset = offset
-        
-        for line in lines:
-            # Skip empty lines
-            if not line.strip():
-                line_offset += len(line) + 1
-                continue
-                
+
+        self._is_file_loaded = success
+        return success
+
+    def _submit_chunk(self, chunk: List[List[str]]):
+        """Submit a chunk for processing to the thread pool."""
+        future = self.thread_pool.submit(self._process_chunk, chunk)
+        future.add_done_callback(self._handle_result)
+
+    def _process_chunk(self, chunk: List[List[str]]):
+        """Process a chunk of CSV rows."""
+        processed = 0
+        for row in chunk:
             try:
-                # Check if we should throttle processing
-                if self.resource_monitor and self.resource_monitor.should_throttle():
-                    time.sleep(0.1)  # Brief pause to reduce resource usage
-                
-                # Decode and split the line
-                decoded_line = line.decode('utf-8').strip()
-                row = decoded_line.split(',')
-                
-                # Process the row if it has enough fields
-                if len(row) > max(cusip_idx, symbol_idx):
-                    cusip = row[cusip_idx]
-                    symbol = row[symbol_idx]
-                    
-                    if cusip and symbol:
-                        # Add to indices
-                        self.indices.add_cusip(cusip, line_offset)
-                        self.indices.add_symbol(symbol, cusip)
-                        
-                        # Add region if available
-                        if region_idx >= 0 and region_idx < len(row):
-                            region = row[region_idx]
-                            if region:
-                                self.indices.add_region(region, cusip)
-                        
-                        # Add exchange if available
-                        if exchange_idx >= 0 and exchange_idx < len(row):
-                            exchange = row[exchange_idx]
-                            if exchange:
-                                self.indices.add_exchange(exchange, cusip)
-                        
-                        rows_processed += 1
-                        
-                        # Update total processed rows
-                        with self.result_lock:
-                            self.processed_rows += 1
-            except UnicodeDecodeError:
-                logger.warning(f"Skipped invalid UTF-8 sequence at offset {line_offset}")
-            except Exception as e:
-                logger.warning(f"Error processing row at offset {line_offset}: {e}")
-            
-            # Update line offset for the next iteration
-            line_offset += len(line) + 1
-        
-        return rows_processed
-    
-    def _process_with_mmap_threaded(self) -> bool:
-        """Process security master using memory mapping with multiple threads."""
-        try:
-            with open(self.file_path, 'rb') as f:
-                # Create memory-mapped file
-                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-                
-                # Find and parse header
-                header_line = mm.readline().decode('utf-8').strip()
-                header_fields = header_line.split(',')
-                self.header = {field: i for i, field in enumerate(header_fields)}
-                
-                # Check required fields
-                if 'CUSIP' not in self.header or 'Symbol' not in self.header:
-                    logger.error("Security master file missing required columns: CUSIP, Symbol")
-                    return False
-                
-                # Calculate chunk size in bytes from config
-                chunk_size_bytes = self.config.chunk_size_mb * 1024 * 1024
-                
-                # Initialize progress tracking
-                last_log_time = time.time()
-                last_position = mm.tell()
-                
-                # Create a thread pool for processing chunks
-                thread_count = self.config.thread_count
-                logger.info(f"Processing with {thread_count} threads")
-                self.thread_pool = ThreadPoolExecutor(max_workers=thread_count)
-                
-                # Start producer thread to enqueue chunks
-                producer_thread = threading.Thread(
-                    target=self._chunk_producer, 
-                    args=(mm, chunk_size_bytes, self.header)
-                )
-                producer_thread.daemon = True
-                producer_thread.start()
-                
-                # Start worker threads to process chunks
-                futures = []
-                for _ in range(thread_count):
-                    futures.append(self.thread_pool.submit(self._chunk_consumer))
-                
-                # Monitor progress
-                try:
-                    while producer_thread.is_alive() or not self.job_queue.empty():
-                        # Check if it's time to log progress
-                        current_time = time.time()
-                        if current_time - last_log_time > self.config.logging_interval:
-                            position = mm.tell()
-                            progress = (position / self.file_size) * 100
-                            speed = (position - last_position) / (current_time - last_log_time) / (1024 * 1024)
-                            
-                            # Log progress
-                            logger.info(f"Processing: {progress:.1f}% complete, "
-                                       f"speed: {speed:.1f} MB/s, "
-                                       f"rows: {self.processed_rows:,}")
-                            
-                            # Update values for next iteration
-                            last_log_time = current_time
-                            last_position = position
-                            
-                            # Check if we should adjust thread count
-                            if self.resource_monitor and self.config.adaptative_threading:
-                                optimal_count = self.resource_monitor.get_optimal_thread_count()
-                                if optimal_count != thread_count:
-                                    logger.info(f"Adjusting thread count from {thread_count} to {optimal_count}")
-                                    # This doesn't change existing threads, but affects future ones
-                                    if optimal_count > thread_count:
-                                        # Add more worker threads
-                                        for _ in range(optimal_count - thread_count):
-                                            futures.append(self.thread_pool.submit(self._chunk_consumer))
-                                    thread_count = optimal_count
-                            
-                        time.sleep(0.5)
-                except KeyboardInterrupt:
-                    logger.warning("Interrupted by user, finishing current tasks...")
-                
-                # Wait for producer to finish
-                producer_thread.join()
-                
-                # Shutdown the thread pool
-                self.thread_pool.shutdown(wait=True)
-                
-                logger.info(f"Processed {self.processed_rows:,} rows from security master")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error in multi-threaded processing: {e}")
-            return False
-    
-    def _chunk_producer(self, mm: mmap.mmap, chunk_size: int, header: Dict[str, int]):
-        """
-        Producer function that reads chunks from the file and puts them in the job queue.
-        
-        Args:
-            mm: Memory-mapped file
-            chunk_size: Size of each chunk in bytes
-            header: Dictionary mapping field names to column indices
-        """
-        try:
-            # Set initial offset after header
-            current_offset = mm.tell()
-            remainder = b""
-            remainder_offset = current_offset
-            
-            while True:
-                # Try to read a chunk
-                chunk = mm.read(chunk_size)
-                if not chunk:
-                    break
-                
-                # Prepend remainder from previous chunk if any
-                data = remainder + chunk
-                data_offset = remainder_offset
-                
-                # Find the last newline in the chunk
-                last_newline = data.rfind(b'\n')
-                if last_newline == -1:
-                    # No newline in chunk, unusual but possible
-                    remainder = data
-                    remainder_offset = data_offset
-                    continue
-                
-                # Split data at the last newline
-                usable_data = data[:last_newline+1]
-                remainder = data[last_newline+1:]
-                remainder_offset = data_offset + last_newline + 1
-                
-                # Put the chunk in the job queue
-                while True:
-                    # Check if we should throttle
-                    if self.resource_monitor and self.resource_monitor.should_throttle():
-                        time.sleep(0.1)
-                        continue
-                    
-                    try:
-                        self.job_queue.put((usable_data, data_offset, header), block=True, timeout=1)
-                        break
-                    except Exception:
-                        # Queue is full, wait a bit
-                        if self.resource_monitor and self.resource_monitor.should_throttle():
-                            time.sleep(0.5)
-                        else:
-                            time.sleep(0.1)
-            
-            # Process any remaining data
-            if remainder:
-                self.job_queue.put((remainder, remainder_offset, header), block=True)
-                
-        except Exception as e:
-            logger.error(f"Error in chunk producer: {e}")
-            
-        finally:
-            # Signal that we're done by adding None to the queue for each worker
-            for _ in range(self.config.thread_count * 2):  # Add extra to ensure all workers get the signal
-                try:
-                    self.job_queue.put(None, block=True, timeout=1)
-                except Exception:
-                    pass
-    
-    def _chunk_consumer(self):
-        """
-        Consumer function that processes chunks from the job queue.
-        
-        This function runs in a worker thread and processes chunks until
-        it receives a None sentinel value.
-        """
-        while True:
-            try:
-                # Get a job from the queue
-                job = self.job_queue.get(block=True)
-                
-                # Check if we're done
-                if job is None:
-                    break
-                
-                # Process the chunk
-                self._process_chunk(job)
-                
-                # Mark the job as done
-                self.job_queue.task_done()
-                
-            except Exception as e:
-                logger.error(f"Error in chunk consumer: {e}")
-    
-    def _process_with_reader_threaded(self) -> bool:
-        """Process security master using standard file reader with multiple threads."""
-        logger.info("Memory mapping disabled, using standard file reader")
-        
-        try:
-            with open(self.file_path, 'r', newline='') as csvfile:
-                # Parse header
-                reader = csv.reader(csvfile)
-                header_row = next(reader)
-                self.header = {field: i for i, field in enumerate(header_row)}
-                
-                # Check required fields
-                if 'CUSIP' not in self.header or 'Symbol' not in self.header:
-                    logger.error("Security master file missing required columns: CUSIP, Symbol")
-                    return False
-                
-                # Calculate chunk size - number of rows per chunk
-                rows_per_chunk = 100000  # Adjust based on expected row size
-                
-                # Create a thread pool for processing
-                self.thread_pool = ThreadPoolExecutor(max_workers=self.config.thread_count)
-                
-                # Initialize tracking
-                chunk_rows = []
-                chunks_submitted = 0
-                last_log_time = time.time()
-                
-                # Process in chunks
-                for row in reader:
-                    chunk_rows.append(row)
-                    
-                    # When we have enough rows, submit the chunk for processing
-                    if len(chunk_rows) >= rows_per_chunk:
-                        self._submit_row_chunk(chunk_rows, self.header)
-                        chunks_submitted += 1
-                        chunk_rows = []
-                        
-                        # Check if it's time to log progress
-                        current_time = time.time()
-                        if current_time - last_log_time > self.config.logging_interval:
-                            position = csvfile.tell()
-                            progress = (position / self.file_size) * 100
-                            logger.info(f"Processing: {progress:.1f}% complete, "
-                                       f"rows: {self.processed_rows:,}, "
-                                       f"chunks: {chunks_submitted}")
-                            last_log_time = current_time
-                
-                # Process any remaining rows
-                if chunk_rows:
-                    self._submit_row_chunk(chunk_rows, self.header)
-                    chunks_submitted += 1
-                
-                # Shutdown the thread pool
-                self.thread_pool.shutdown(wait=True)
-                
-                logger.info(f"Processed {self.processed_rows:,} rows from security master "
-                           f"in {chunks_submitted} chunks")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error in reader-based processing: {e}")
-            return False
-    
-    def _submit_row_chunk(self, rows: List[List[str]], header: Dict[str, int]):
-        """
-        Submit a chunk of rows for processing.
-        
-        Args:
-            rows: List of row data
-            header: Dictionary mapping field names to column indices
-        """
-        # Wait until the thread pool is available
-        while self.resource_monitor and self.resource_monitor.should_throttle():
-            time.sleep(0.1)
-            
-        # Submit the chunk for processing
-        self.thread_pool.submit(self._process_row_chunk, rows, header)
-    
-    def _process_row_chunk(self, rows: List[List[str]], header: Dict[str, int]):
-        """
-        Process a chunk of rows.
-        
-        Args:
-            rows: List of row data
-            header: Dictionary mapping field names to column indices
-        """
-        # Get indices for the fields we care about
-        cusip_idx = header.get('CUSIP', -1)
-        symbol_idx = header.get('Symbol', -1)
-        region_idx = header.get('Region', -1)
-        exchange_idx = header.get('Exchange', -1)
-        
-        # Check if we have the required indices
-        if cusip_idx < 0 or symbol_idx < 0:
-            logger.error("Missing required columns in header")
-            return
-        
-        # Process each row
-        for row in rows:
-            try:
-                # Check if we should throttle
-                if self.resource_monitor and self.resource_monitor.should_throttle():
-                    time.sleep(0.1)
-                    
-                # Make sure the row has enough fields
-                if len(row) <= max(cusip_idx, symbol_idx):
-                    continue
-                    
-                cusip = row[cusip_idx]
-                symbol = row[symbol_idx]
-                
-                if cusip and symbol:
-                    # Add to indices - use position 0 as a placeholder since we don't
-                    # have the actual file position in this mode
-                    self.indices.add_cusip(cusip, 0)
+                cusip = row[self.header['CUSIP']]
+                symbol = row[self.header['Symbol']]
+                region = row[self.header['Region']]
+                exchange = row[self.header['Exchange']]
+
+                with self.result_lock:
+                    self.indices.add_cusip(cusip, self.file.tell())
                     self.indices.add_symbol(symbol, cusip)
-                    
-                    # Add region if available
-                    if region_idx >= 0 and region_idx < len(row):
-                        region = row[region_idx]
-                        if region:
-                            self.indices.add_region(region, cusip)
-                    
-                    # Add exchange if available
-                    if exchange_idx >= 0 and exchange_idx < len(row):
-                        exchange = row[exchange_idx]
-                        if exchange:
-                            self.indices.add_exchange(exchange, cusip)
-                    
-                    # Update processed rows counter
-                    with self.result_lock:
-                        self.processed_rows += 1
-                        
+                    self.indices.add_region(region, cusip)
+                    self.indices.add_exchange(exchange, cusip)
+
+                processed += 1
             except Exception as e:
-                logger.warning(f"Error processing row: {e}")
-    
-    def get_record_by_cusip(self, cusip: str) -> Optional[Dict[str, str]]:
-        """
-        Get a security record by CUSIP.
-        
-        Instead of keeping all records in memory, this fetches the specific
-        record from disk when needed.
-        
-        Args:
-            cusip: CUSIP identifier
-            
-        Returns:
-            Security record dictionary or None if not found
-        """
-        if not self.is_loaded:
-            return None
-            
+                logger.warning(f"Invalid row: {str(e)}")
+        return processed
+
+    def _handle_result(self, future):
+        """Handle completion of a chunk processing task."""
         try:
-            position = self.indices.cusip_index.get(cusip)
-            if position is None:
-                return None
-                
-            # If position is 0, it means we don't have the actual file position
-            # In that case, we need to search the file for the CUSIP
-            if position == 0:
-                return self._search_by_cusip(cusip)
-            
-            # Read the record from the file
-            with open(self.file_path, 'r', newline='') as f:
-                f.seek(position)
-                line = f.readline().strip()
-                
-                # Parse the CSV line
-                values = next(csv.reader([line]))
-                
-                # Create dictionary
-                return {field: values[idx] for field, idx in self.header.items() 
-                        if idx < len(values)}
-                
+            processed = future.result()
+            with self.result_lock:
+                self.processed_rows += processed
+            logger.debug(f"Processed chunk with {processed} rows")
         except Exception as e:
-            logger.error(f"Error retrieving record by CUSIP: {e}")
-            return None
+            logger.error(f"Chunk processing failed: {str(e)}")
+
+    def is_file_loaded(self) -> bool:
+        """Return True if the security master was successfully loaded."""
+        return self._is_file_loaded
+
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Format the file size as a human-readable string."""
+        return self._format_bytes(size_bytes)
+
+    def _format_bytes(self, bytes_value: int) -> str:
+        """Convert bytes to a human-readable string."""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_value < 1024 or unit == 'TB':
+                return f"{bytes_value:.2f} {unit}"
+            bytes_value /= 1024
+
+    def get_security_dict(self, fields: List[str] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Return a lightweight dictionary snapshot of the security master data.
+        Currently, fields filtering is not implemented.
+        """
+        return self.indices.get_dict_snapshot()
     
-    def _search_by_cusip(self, cusip: str) -> Optional[Dict[str, str]]:
-        """
-        Search for a record by CUSIP when the file position is not known.
+def load_security_master_data(secmaster_path: str, 
+                             chunk_size_mb: int = DEFAULT_CHUNK_SIZE_MB, 
+                             use_mmap: bool = True,
+                             resource_monitor: Optional[ResourceMonitor] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Load and index the security master file in a memory-efficient way.
+    
+    Args:
+        secmaster_path: Path to security master CSV file
+        chunk_size_mb: Size of each chunk to process in MB
+        use_mmap: Whether to use memory mapping for file access
+        resource_monitor: Resource monitor instance for throttling
         
-        Args:
-            cusip: CUSIP identifier
-            
-        Returns:
-            Security record dictionary or None if not found
-        """
+    Returns:
+        Dictionary of security master data indexed by CUSIP
+        
+    Raises:
+        FileNotFoundError: If security master file doesn't exist
+        ValueError: If security master file is invalid
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading security master from: {secmaster_path}")
+    
+    # Check if file exists
+    if not os.path.exists(secmaster_path):
+        logger.error(f"Security master file not found: {secmaster_path}")
+        raise FileNotFoundError(f"Security master file not found: {secmaster_path}")
+    
+    # Check file size
+    file_size = os.path.getsize(secmaster_path)
+    file_size_mb = file_size / (1024 * 1024)
+    logger.info(f"Security master file size: {file_size_mb:.2f} MB")
+    
+    # Fast path for small files (< 10MB)
+    if file_size_mb < 10:
+        logger.info("Using fast path for small security master file")
         try:
-            with open(self.file_path, 'r', newline='') as f:
-                reader = csv.reader(f)
-                next(reader)  # Skip header
-                
-                cusip_idx = self.header.get('CUSIP')
-                if cusip_idx is None:
-                    return None
-                    
-                for row in reader:
-                    if len(row) > cusip_idx and row[cusip_idx] == cusip:
-                        return {field: row[idx] for field, idx in self.header.items() 
-                                if idx < len(row)}
-                        
-            return None
-            
+            return load_small_secmaster(secmaster_path)
         except Exception as e:
-            logger.error(f"Error searching by CUSIP: {e}")
-            return None
+            logger.error(f"Fast path failed, falling back to standard loader: {e}")
+            # Fall through to standard loading
     
-    def get_symbol_by_cusip(self, cusip: str) -> Optional[str]:
-        """
-        Get the symbol for a given CUSIP.
-        
-        Args:
-            cusip: CUSIP identifier
-            
-        Returns:
-            Symbol string or None if not found
-        """
-        if not self.is_loaded:
-            return None
-            
-        try:
-            record = self.get_record_by_cusip(cusip)
-            return record.get('Symbol') if record else None
-        except Exception as e:
-            logger.error(f"Error retrieving symbol by CUSIP: {e}")
-            return None
+    # Standard loading for larger files
+    # Log memory usage at start
+    process = psutil.Process(os.getpid())
+    start_memory = process.memory_info().rss
+    logger.info(f"Memory usage before loading: {start_memory / (1024**2):.1f} MB")
     
-    def get_cusip_by_symbol(self, symbol: str) -> Optional[str]:
-        """
-        Get CUSIP by symbol.
-        
-        Args:
-            symbol: Security symbol
-            
-        Returns:
-            CUSIP string or None if not found
-        """
-        if not self.is_loaded:
-            return None
-            
-        return self.indices.symbol_index.get(symbol)
+    # Start loading timer
+    start_time = time.time()
     
-    def validate_symbol_cusip_pair(self, symbol: str, cusip: str) -> Tuple[bool, Optional[str]]:
-        """
-        Validate if a symbol matches the expected symbol for a CUSIP.
+    # Load the security master with chunked loading
+    try:
+        # Call the factory function from security_master.py
+        sec_master = load_security_master(secmaster_path)
         
-        Args:
-            symbol: Symbol to validate
-            cusip: CUSIP to check against
-            
-        Returns:
-            Tuple of (is_valid, expected_symbol)
-            - is_valid: True if symbol matches CUSIP, False otherwise
-            - expected_symbol: Expected symbol if different, None if match
-        """
-        if not self.is_loaded:
-            logger.warning("Attempted validation before security master was loaded")
-            return (False, None)
-            
-        expected_symbol = self.get_symbol_by_cusip(cusip)
+        if not sec_master.is_file_loaded():
+            logger.error(f"Failed to load security master from: {secmaster_path}")
+            raise ValueError(f"Failed to load security master from: {secmaster_path}")
         
-        if not expected_symbol:
-            logger.warning(f"CUSIP {cusip} not found in security master")
-            return (False, None)
-            
-        if symbol == expected_symbol:
-            return (True, None)
-        else:
-            return (False, expected_symbol)
+        # Throttle if needed before getting security dict
+        if resource_monitor:
+            throttle_processing(resource_monitor)
+        
+        # Get a lightweight dictionary for the analyzer
+        # This specifically requests only the fields needed for analysis
+        security_data = sec_master.get_security_dict(fields=['Symbol', 'Region', 'Exchange'])
+        
+        # Log timing and memory stats
+        elapsed_time = time.time() - start_time
+        current_memory = process.memory_info().rss
+        memory_increase = current_memory - start_memory
+        
+        logger.info(f"Loaded {len(security_data)} securities in {elapsed_time:.2f} seconds")
+        logger.info(f"Memory usage after loading: {current_memory / (1024**2):.1f} MB " +
+                   f"(increase: {memory_increase / (1024**2):.1f} MB)")
+        
+        # Log some stats about the security master
+        regions = set(sec.get('Region', 'Unknown') for sec in security_data.values() if 'Region' in sec)
+        exchanges = set(sec.get('Exchange', 'Unknown') for sec in security_data.values() if 'Exchange' in sec)
+        
+        logger.info(f"Security master covers {len(regions)} regions and {len(exchanges)} exchanges")
+        
+        return security_data
     
-    def get_security_dict(self) -> Dict[str, Dict[str, Any]]:
-            """
-            Get a lightweight dictionary suitable for the analyzer.
-            
-            This creates a minimal representation needed by the analyzer
-            without loading all record details into memory.
-            
-            Returns:
-                Dictionary mapping CUSIPs to minimal security records
-            """
-            if not self.is_loaded:
-                logger.warning("Attempted to get security dict before security master was loaded")
-                return {}
-                
-            # Build a lightweight dictionary with just the Symbol and critical grouping fields
-            security_dict = {}
-            essential_fields = ['Symbol', 'Region', 'Exchange']
-            
-            # Process each CUSIP in batches to manage memory
-            cusips = list(self.cusip_index.keys())
-            batch_size = min(10000, len(cusips))
-            
-            # Pre-compute field indices for direct access
-            field_indices = {field: self.header.get(field, -1) for field in essential_fields}
-            
-            for i in range(0, len(cusips), batch_size):
-                batch = cusips[i:i+batch_size]
-                
-                for cusip in batch:
-                    try:
-                        # Directly extract only essential fields using column indices
-                        # instead of loading the entire record into memory
-                        with open(self.file_path, 'r', newline='') as f:
-                            position = self.cusip_index[cusip]
-                            f.seek(position)
-                            line = f.readline().strip()
-                            
-                            # Parse the CSV line
-                            values = next(csv.reader([line]))
-                            
-                            # Extract only the essential fields by index
-                            security_dict[cusip] = {}
-                            for field, idx in field_indices.items():
-                                if idx >= 0 and idx < len(values):
-                                    security_dict[cusip][field] = values[idx]
-                    except Exception as e:
-                        logger.warning(f"Error retrieving data for CUSIP {cusip}: {e}")
-                
-                # Release memory after each batch
-                gc.collect()
-                
-            return security_dict
+    except Exception as e:
+        logger.error(f"Error loading security master: {e}")
+        raise
     
     def get_securities_by_region(self, region: str) -> List[Dict[str, Any]]:
         """
@@ -1016,7 +562,7 @@ class ChunkedSecurityMasterLoader:
         Returns:
             List of security records in the region
         """
-        if not self.is_loaded:
+        if not self.is_file_loaded:
             logger.warning("Attempted lookup before security master was loaded")
             return []
             
@@ -1049,7 +595,7 @@ class ChunkedSecurityMasterLoader:
     
     def is_file_loaded(self) -> bool:
         """Check if security master data has been loaded."""
-        return self.is_loaded
+        return self.is_file_loaded
     
     def _format_file_size(self, size_bytes: int) -> str:
         """Format file size as human-readable string."""
