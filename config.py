@@ -31,6 +31,21 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
 
+# Force file and console logging -----------------------------------
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("security_master_debug.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Make sure all loggers show DEBUG -----------------------
+for name in logging.root.manager.loggerDict:
+    logging.getLogger(name).setLevel(logging.DEBUG)
+
+
 def setup_logging(log_level: str = 'INFO', log_file: Optional[str] = None) -> None:
     """
     Configure the logging system with the specified level and optional file output.
