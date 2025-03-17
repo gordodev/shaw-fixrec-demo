@@ -134,19 +134,7 @@ def load_security_master_data(secmaster_path: str, chunk_size_mb: int = 64, use_
 
 
 def parse_fix_log(fix_log_path: str, delimiter: str = "|") -> List[Dict[str, Any]]:
-    """
-    Parse the FIX message log file.
-    
-    Args:
-        fix_log_path: Path to FIX log file
-        delimiter: Character used to separate FIX fields (default: |)
-        
-    Returns:
-        List of parsed FIX messages
-        
-    Raises:
-        FileNotFoundError: If FIX log file doesn't exist
-    """
+    """Parse the FIX message log file."""
     logger = logging.getLogger(__name__)
     logger.info(f"Parsing FIX messages from: {fix_log_path}")
     
@@ -162,12 +150,13 @@ def parse_fix_log(fix_log_path: str, delimiter: str = "|") -> List[Dict[str, Any
     
     stats = fix_parser.get_statistics(messages)
     
-    logger.info(f"Parsed {stats['total_messages']} messages in {elapsed_time:.2f} seconds: "
-               f"{stats['new_order_singles']} new orders, "
-               f"{stats['execution_reports']} execution reports")
+    # Safe logging that handles empty statistics
+    logger.info(f"Parsed {stats.get('total_messages', 0)} messages in {elapsed_time:.2f} seconds: "
+               f"{stats.get('new_order_singles', 0)} new orders, "
+               f"{stats.get('execution_reports', 0)} execution reports")
     logger.info(f"Memory usage for FIX parsing: {memory_increase / (1024**2):.1f} MB")
     
-    # Convert to dicts for analyzer and trigger garbage collection
+    # Convert to dicts for analyzer
     message_dicts = []
     for msg in messages:
         msg_dict = {
@@ -181,10 +170,7 @@ def parse_fix_log(fix_log_path: str, delimiter: str = "|") -> List[Dict[str, Any
         }
         message_dicts.append(msg_dict)
     
-    # Clear the original messages list to free memory
-    messages.clear()
-    gc.collect()
-    
+    # Return empty list if no valid messages rather than crashing
     return message_dicts
 
 
