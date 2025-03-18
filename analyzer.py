@@ -119,7 +119,8 @@ class DiscrepancyAnalyzer:
                     "FIXSymbol": fix_symbol,
                     "Quantity": quantity,
                     "Price": price,
-                    "Exposure": exposure
+                    "Exposure": exposure,
+                    "DiscrepancyType": "Symbol Mismatch"
                 }
                 
                 # Add optional fields if available in security master
@@ -146,9 +147,25 @@ class DiscrepancyAnalyzer:
                             f"Master Symbol={master_symbol}, "
                             f"Exposure=${exposure:.2f}")
         else:
-            # Track unknown CUSIPs
+            # CUSIP not found in security master - add as a discrepancy
             self.unknown_cusips.add(cusip)
-            logger.debug(f"Unknown CUSIP in FIX message: {cusip}")
+            
+            # Create discrepancy record for unknown CUSIP
+            exposure = quantity * price
+            
+            discrepancy = {
+                "CUSIP": cusip,
+                "MasterSymbol": "UNKNOWN",  # CUSIP not in security master
+                "FIXSymbol": fix_symbol,
+                "Quantity": quantity,
+                "Price": price,
+                "Exposure": exposure,
+                "DiscrepancyType": "Unknown CUSIP"  # Add a type to distinguish these
+            }
+            
+            self.discrepancies.append(discrepancy)
+            self.total_exposure += exposure
+            logger.debug(f"Unknown CUSIP in FIX message: {cusip}, added as discrepancy")
     
     def get_region_metrics(self) -> Dict[str, Dict[str, Any]]:
         """
