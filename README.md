@@ -19,6 +19,7 @@ This tool identifies discrepancies between FIX message symbols and the security 
 This project was implemented with a 12-hour turnaround goal to demonstrate rapid problem-solving skills. Some compromises were made to prioritize core functionality:
 
 - Testing is minimal (would add pytest coverage in production)
+- I started some edge testing with 200GB secmaster file. Chunking is working but I need to get memory under control.
 - Error handling focuses on critical paths only
 - Logging is simplified
 - Documentation is condensed

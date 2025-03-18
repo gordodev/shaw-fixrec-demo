@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Chunked Security Master Loader
+Chunked Security Master Loader with Multi-Threading Support
 
 This module provides efficient handling of extremely large security master files
-by loading and processing them in manageable chunks rather than all at once.
+by loading and processing them in manageable chunks using multiple threads.
 Optimized for memory efficiency with production-grade error handling, logging,
-and monitoring capabilities.
+and resource monitoring capabilities.
 
 Key features:
 - Streaming CSV processing (no full file load)
 - Memory-efficient CUSIP/Symbol indexing
-- Configurable chunk size to balance performance & memory usage
-- Detailed performance metrics and memory monitoring
-- Production-grade error handling and reporting
+- Multi-threaded chunk processing
+- Resource monitoring to prevent system overload 
+- Configurable thread count and chunk size
+- Thread-safe data structure access
 
 Author: Carlyle
 Date: March 16, 2025
@@ -32,7 +33,12 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Iterator, Optional, Any, Callable, Generator
 from dataclasses import dataclass
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from threading import Lock
 
+# Constants for chunked processing
+DEFAULT_CHUNK_SIZE_MB = 64  # Default chunk size in MB
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -48,41 +54,60 @@ class SecurityMasterConfig:
     max_retries: int = 3  # Maximum number of retries on failure
     enable_mmap: bool = True  # Use memory mapping for faster file access
     logging_interval: int = 5  # Log progress every N seconds
+    thread_count: int = 3  # Number of threads to use for processing
+    max_queue_size: int = 10  # Maximum number of chunks to queue
+    cpu_threshold_pct: int = 80  # CPU usage threshold to throttle processing
+    adaptative_threading: bool = True  # Dynamically adjust thread count based on system load
 
 
-class MemoryUsageMonitor:
-    """Monitor memory usage during processing."""
+class ResourceMonitor:
+    """
+    Monitor system resources during processing and adjust thread usage accordingly.
     
-    def __init__(self, threshold_percent: int = 90, check_interval: float = 1.0):
+    This class provides real-time monitoring of CPU, memory, and disk usage
+    to prevent system overload during multi-threaded processing.
+    """
+    
+    def __init__(self, cpu_threshold: int = 80, memory_threshold: int = 90, 
+                 check_interval: float = 1.0, adaptative: bool = True):
         """
-        Initialize memory monitor.
+        Initialize the resource monitor.
         
         Args:
-            threshold_percent: Percentage threshold to trigger warnings
-            check_interval: How often to check memory usage (seconds)
+            cpu_threshold: CPU usage percentage threshold to trigger throttling
+            memory_threshold: Memory usage percentage threshold to trigger GC
+            check_interval: How often to check resource usage (seconds)
+            adaptative: Whether to adaptively adjust thread count
         """
-        self.threshold_percent = threshold_percent
+        self.cpu_threshold = cpu_threshold
+        self.memory_threshold = memory_threshold
         self.check_interval = check_interval
+        self.adaptative = adaptative
         self.stop_flag = threading.Event()
         self.monitor_thread = None
         self.peak_memory_usage = 0
+        self.peak_cpu_usage = 0
+        self.optimal_thread_count = 3  # Default starting point
+        self.throttle_event = threading.Event()
         self.start_memory_usage = 0
         
     def start(self):
-        """Start memory usage monitoring."""
+        """Start resource monitoring in a separate thread."""
         if self.monitor_thread is not None:
             return
             
         self.stop_flag.clear()
-        self.start_memory_usage = self._get_current_usage()
+        self.throttle_event.clear()
+        self.start_memory_usage = self._get_memory_usage()
         self.peak_memory_usage = self.start_memory_usage
+        self.peak_cpu_usage = 0
         
         self.monitor_thread = threading.Thread(target=self._monitor_loop)
         self.monitor_thread.daemon = True
         self.monitor_thread.start()
         
     def stop(self):
-        """Stop memory usage monitoring."""
+        """Stop resource monitoring."""
         if self.monitor_thread is None:
             return
             
@@ -90,46 +115,112 @@ class MemoryUsageMonitor:
         self.monitor_thread.join(timeout=2.0)
         self.monitor_thread = None
         
-    def get_peak_usage(self) -> Tuple[int, float]:
+    def should_throttle(self) -> bool:
+        """Check if processing should be throttled."""
+        return self.throttle_event.is_set()
+        
+    def get_optimal_thread_count(self) -> int:
+        """Get the current optimal thread count based on system load."""
+        return self.optimal_thread_count
+        
+    def get_peak_usage(self) -> Tuple[int, float, float]:
         """
-        Get peak memory usage during monitoring.
+        Get peak resource usage during monitoring.
         
         Returns:
-            Tuple of (peak usage in bytes, peak percentage)
+            Tuple of (peak memory in bytes, peak memory percentage, peak CPU percentage)
         """
-        return (self.peak_memory_usage, self._bytes_to_percent(self.peak_memory_usage))
+        return (self.peak_memory_usage, 
+                self._bytes_to_memory_percent(self.peak_memory_usage),
+                self.peak_cpu_usage)
         
     def _monitor_loop(self):
         """Main monitoring loop."""
         while not self.stop_flag.is_set():
             try:
-                current_usage = self._get_current_usage()
-                current_percent = self._bytes_to_percent(current_usage)
+                # Check memory usage
+                current_memory = self._get_memory_usage()
+                memory_percent = self._bytes_to_memory_percent(current_memory)
                 
-                # Update peak memory usage
-                if current_usage > self.peak_memory_usage:
-                    self.peak_memory_usage = current_usage
+                # Check CPU usage
+                cpu_percent = psutil.cpu_percent(interval=0.1)
                 
-                # Check threshold
-                if current_percent >= self.threshold_percent:
+                # Check disk I/O
+                disk_io = psutil.disk_io_counters()
+                
+                # Update peak values
+                if current_memory > self.peak_memory_usage:
+                    self.peak_memory_usage = current_memory
+                
+                if cpu_percent > self.peak_cpu_usage:
+                    self.peak_cpu_usage = cpu_percent
+                
+                # Determine if throttling is needed
+                need_throttling = False
+                
+                if memory_percent >= self.memory_threshold:
                     logger.warning(
-                        f"Memory usage critical: {current_percent:.1f}% "
-                        f"({self._format_bytes(current_usage)})"
+                        f"Memory usage critical: {memory_percent:.1f}% "
+                        f"({self._format_bytes(current_memory)})"
                     )
                     # Suggest garbage collection
                     collected = gc.collect()
                     logger.info(f"Forced garbage collection: {collected} objects collected")
+                    need_throttling = True
+                    
+                if cpu_percent >= self.cpu_threshold:
+                    logger.warning(f"CPU usage critical: {cpu_percent:.1f}%")
+                    need_throttling = True
+                
+                # Set throttle event if needed
+                if need_throttling:
+                    if not self.throttle_event.is_set():
+                        logger.info("Throttling enabled due to high resource usage")
+                        self.throttle_event.set()
+                elif self.throttle_event.is_set():
+                    logger.info("Resource usage normalized, resuming full speed")
+                    self.throttle_event.clear()
+                
+                # Adjust optimal thread count if adaptative mode is enabled
+                if self.adaptative:
+                    self._adjust_thread_count(cpu_percent, memory_percent)
                 
             except Exception as e:
-                logger.error(f"Error in memory monitor: {e}")
+                logger.error(f"Error in resource monitor: {e}")
                 
             time.sleep(self.check_interval)
     
-    def _get_current_usage(self) -> int:
+    def _adjust_thread_count(self, cpu_percent: float, memory_percent: float):
+        """
+        Dynamically adjust the optimal thread count based on system load.
+        
+        Args:
+            cpu_percent: Current CPU usage percentage
+            memory_percent: Current memory usage percentage
+        """
+        # Start with the default of 3 threads
+        new_count = 3
+        
+        # Reduce threads if system is under heavy load
+        if cpu_percent > 90 or memory_percent > 90:
+            new_count = 1
+        elif cpu_percent > 80 or memory_percent > 80:
+            new_count = 2
+        elif cpu_percent < 50 and memory_percent < 60:
+            # Increase threads if system has plenty of capacity
+            new_count = 4
+        
+        # Update the optimal thread count if it changed
+        if new_count != self.optimal_thread_count:
+            logger.info(f"Adjusting optimal thread count from {self.optimal_thread_count} to {new_count} "
+                       f"(CPU: {cpu_percent:.1f}%, Memory: {memory_percent:.1f}%)")
+            self.optimal_thread_count = new_count
+    
+    def _get_memory_usage(self) -> int:
         """Get current memory usage in bytes."""
         return psutil.Process(os.getpid()).memory_info().rss
         
-    def _bytes_to_percent(self, bytes_value: int) -> float:
+    def _bytes_to_memory_percent(self, bytes_value: int) -> float:
         """Convert bytes to percentage of total system memory."""
         total_memory = psutil.virtual_memory().total
         return (bytes_value / total_memory) * 100
@@ -142,414 +233,326 @@ class MemoryUsageMonitor:
             bytes_value /= 1024
 
 
-class ChunkedSecurityMasterLoader:
-    """
-    Memory-efficient security master loader that processes files in chunks.
+class ThreadSafeIndices:
+    """Thread-safe container for security master indices."""
     
-    This class allows processing extremely large security master files
-    without loading the entire file into memory at once. It builds indexes
-    incrementally and provides streaming access to the data.
-    """
-    
-    def __init__(self, config: Optional[SecurityMasterConfig] = None):
-        """
-        Initialize the chunked loader.
-        
-        Args:
-            config: Configuration options (or None for defaults)
-        """
-        self.config = config or SecurityMasterConfig()
+    def __init__(self):
+        """Initialize the thread-safe indices."""
         self.cusip_index = {}  # Maps CUSIP to file position
         self.symbol_index = {}  # Maps symbol to CUSIP
         self.region_index = {}  # Maps region to list of CUSIPs
         self.exchange_index = {}  # Maps exchange to list of CUSIPs
+        self.locks = {
+            'cusip': threading.RLock(),
+            'symbol': threading.RLock(),
+            'region': threading.RLock(),
+            'exchange': threading.RLock()
+        }
         
+    def add_cusip(self, cusip: str, position: int):
+        """Add a CUSIP to file position mapping."""
+        with self.locks['cusip']:
+            self.cusip_index[cusip] = position
+            
+    def add_symbol(self, symbol: str, cusip: str):
+        """Add a symbol to CUSIP mapping."""
+        with self.locks['symbol']:
+            self.symbol_index[symbol] = cusip
+            
+    def add_region(self, region: str, cusip: str):
+        """Add a CUSIP to a region."""
+        with self.locks['region']:
+            if region not in self.region_index:
+                self.region_index[region] = []
+            self.region_index[region].append(cusip)
+            
+    def add_exchange(self, exchange: str, cusip: str):
+        """Add a CUSIP to an exchange."""
+        with self.locks['exchange']:
+            if exchange not in self.exchange_index:
+                self.exchange_index[exchange] = []
+            self.exchange_index[exchange].append(cusip)
+            
+    def get_cusip_count(self) -> int:
+        """Get the number of CUSIPs indexed."""
+        with self.locks['cusip']:
+            return len(self.cusip_index)
+            
+    def get_regions(self) -> List[str]:
+        """Get the list of all regions."""
+        with self.locks['region']:
+            return list(self.region_index.keys())
+            
+    def get_exchanges(self) -> List[str]:
+        """Get the list of all exchanges."""
+        with self.locks['exchange']:
+            return list(self.exchange_index.keys())
+            
+    def get_dict_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Get a snapshot of the data for the analyzer."""
+        result = {}
+        with self.locks['cusip'], self.locks['symbol'], self.locks['region'], self.locks['exchange']:
+            for cusip in self.cusip_index.keys():
+                result[cusip] = {}
+                # Add symbol if available
+                for symbol, c in self.symbol_index.items():
+                    if c == cusip:
+                        result[cusip]['Symbol'] = symbol
+                        break
+                # Add region if available
+                for region, cusips in self.region_index.items():
+                    if cusip in cusips:
+                        result[cusip]['Region'] = region
+                        break
+                # Add exchange if available
+                for exchange, cusips in self.exchange_index.items():
+                    if cusip in cusips:
+                        result[cusip]['Exchange'] = exchange
+                        break
+        return result
+
+
+class ChunkedSecurityMasterLoader:
+    def __init__(self, config: Optional[SecurityMasterConfig] = None):
+        self.config = config or SecurityMasterConfig()
+        self.indices = ThreadSafeIndices()
         self.file_path = None
         self.file_size = 0
         self.header = {}
-        self.is_loaded = False
-        self.memory_monitor = None
+        self._is_file_loaded = False
+        self.resource_monitor = None
         self.processed_rows = 0
         self.total_rows = 0
         self.start_time = 0
-        
+        self.thread_pool = None
+        self.job_queue = Queue(maxsize=self.config.max_queue_size)
+        self.result_lock = threading.Lock()
+        self.file = None  # Add file handle reference
+
     def load(self, file_path: str) -> bool:
-        """
-        Load security master from file and build indexes.
-        
-        This method processes the file in chunks to avoid memory issues.
-        
-        Args:
-            file_path: Path to security master CSV file
-            
-        Returns:
-            True if successful, False otherwise
-        """
+        """Main entry point for loading the security master file."""
         self.file_path = file_path
         self.start_time = time.time()
-        
+        success = False
+
         try:
-            # Check if file exists
             if not os.path.exists(file_path):
                 logger.error(f"Security master file not found: {file_path}")
                 return False
-                
-            # Get file size
+
             self.file_size = os.path.getsize(file_path)
             logger.info(f"Loading security master from {file_path} ({self._format_file_size(self.file_size)})")
-            
-            # Initialize memory monitor if enabled
-            if self.config.monitor_memory:
-                self.memory_monitor = MemoryUsageMonitor(self.config.memory_threshold_pct)
-                self.memory_monitor.start()
-            
-            # Process file in chunks
-            if self.config.enable_mmap and self.file_size > 0:
-                # Use memory mapping for faster access
-                success = self._process_with_mmap()
-            else:
-                # Fall back to regular file reading
-                success = self._process_with_reader()
-                
-            if success:
-                self.is_loaded = True
-                
-                # Log processing stats
-                elapsed = time.time() - self.start_time
-                logger.info(f"Successfully indexed {len(self.cusip_index):,} securities in {elapsed:.2f} seconds")
-                logger.info(f"Found {len(self.region_index)} regions and {len(self.exchange_index)} exchanges")
-                
-                # Log memory usage if monitoring was enabled
-                if self.memory_monitor:
-                    peak_bytes, peak_percent = self.memory_monitor.get_peak_usage()
-                    logger.info(f"Peak memory usage: {self._format_bytes(peak_bytes)} ({peak_percent:.1f}%)")
-                
-                return True
-            
-            return False
-            
+
+            # Initialize resource monitor
+            self.resource_monitor = ResourceMonitor(
+                cpu_threshold=self.config.cpu_threshold_pct,
+                memory_threshold=self.config.memory_threshold_pct,
+                adaptative=self.config.adaptative_threading
+            )
+            self.resource_monitor.start()
+
+            # Open file with appropriate mode
+            file_mode = 'r' if self.config.enable_mmap else 'rb'
+            with open(file_path, file_mode) as self.file:
+                # Memory map the file if enabled
+                if self.config.enable_mmap:
+                    mm = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+                    content = mm.read().decode('utf-8')
+                    mm.close()
+                else:
+                    content = self.file.read()
+
+                # Read CSV header
+                csv_reader = csv.reader(content.splitlines())
+                self.header = {name: idx for idx, name in enumerate(next(csv_reader))}
+
+                # Prepare for chunked processing
+                chunk_size_bytes = self.config.chunk_size_mb * 1024 * 1024
+                self.thread_pool = ThreadPoolExecutor(max_workers=self.config.thread_count)
+
+                # Process chunks
+                chunk = []
+                current_chunk_size = 0
+                for row in csv_reader:
+                    chunk.append(row)
+                    current_chunk_size += sum(len(field) for field in row)
+
+                    if current_chunk_size >= chunk_size_bytes:
+                        self._submit_chunk(chunk)
+                        chunk = []
+                        current_chunk_size = 0
+
+                # Process remaining rows
+                if chunk:
+                    self._submit_chunk(chunk)
+
+                # Wait for completion
+                self.thread_pool.shutdown(wait=True)
+
+            success = True
+            logger.info(f"Successfully loaded {self.indices.get_cusip_count():,} securities")
+
         except Exception as e:
-            logger.error(f"Failed to load security master: {e}")
+            logger.error(f"Failed to load security master: {str(e)}", exc_info=True)
             return False
         finally:
-            # Clean up memory monitor
-            if self.memory_monitor:
-                self.memory_monitor.stop()
-                self.memory_monitor = None
-                
-            # Force garbage collection
+            if self.resource_monitor:
+                self.resource_monitor.stop()
+            if self.thread_pool:
+                self.thread_pool.shutdown(wait=False)
+            print ("Taking out the garbage next")
             gc.collect()
-    
-    def _process_with_mmap(self) -> bool:
-        """Process security master using memory mapping."""
+            print ("garbage tossed")
+
+        self._is_file_loaded = success
+        return success
+
+    def _submit_chunk(self, chunk: List[List[str]]):
+        """Submit a chunk for processing to the thread pool."""
+        future = self.thread_pool.submit(self._process_chunk, chunk)
+        future.add_done_callback(self._handle_result)
+
+    def _process_chunk(self, chunk: List[List[str]]):
+        """Process a chunk of CSV rows."""
+        processed = 0
+        for row in chunk:
+            try:
+                cusip = row[self.header['CUSIP']]
+                symbol = row[self.header['Symbol']]
+                region = row[self.header['Region']]
+                exchange = row[self.header['Exchange']]
+
+                with self.result_lock:
+                    self.indices.add_cusip(cusip, self.file.tell())
+                    self.indices.add_symbol(symbol, cusip)
+                    self.indices.add_region(region, cusip)
+                    self.indices.add_exchange(exchange, cusip)
+
+                processed += 1
+            except Exception as e:
+                logger.warning(f"Invalid row: {str(e)}")
+        return processed
+
+    def _handle_result(self, future):
+        """Handle completion of a chunk processing task."""
         try:
-            with open(self.file_path, 'rb') as f:
-                # Create memory-mapped file
-                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-                
-                # Find and parse header
-                header_line = mm.readline().decode('utf-8').strip()
-                header_fields = header_line.split(',')
-                self.header = {field: i for i, field in enumerate(header_fields)}
-                
-                # Check required fields
-                if 'CUSIP' not in self.header or 'Symbol' not in self.header:
-                    logger.error("Security master file missing required columns: CUSIP, Symbol")
-                    return False
-                
-                # Init progress logging
-                last_log_time = time.time()
-                last_position = mm.tell()
-                region_idx = self.header.get('Region', -1)
-                exchange_idx = self.header.get('Exchange', -1)
-                
-                # Process the file line by line
-                line = mm.readline()
-                self.processed_rows = 0
-                
-                while line:
-                    try:
-                        # Check if it's time to log progress
-                        current_time = time.time()
-                        if current_time - last_log_time > self.config.logging_interval:
-                            position = mm.tell()
-                            progress = (position / self.file_size) * 100
-                            speed = (position - last_position) / (current_time - last_log_time) / (1024 * 1024)
-                            logger.info(f"Processing: {progress:.1f}% complete, speed: {speed:.1f} MB/s, rows: {self.processed_rows:,}")
-                            last_log_time = current_time
-                            last_position = position
-                        
-                        # Process the line
-                        row = line.decode('utf-8').strip().split(',')
-                        if len(row) >= len(self.header):
-                            cusip = row[self.header['CUSIP']]
-                            symbol = row[self.header['Symbol']]
-                            
-                            # Store position
-                            position = mm.tell() - len(line)
-                            self.cusip_index[cusip] = position
-                            self.symbol_index[symbol] = cusip
-                            
-                            # Add to region index if available
-                            if region_idx >= 0 and region_idx < len(row):
-                                region = row[region_idx]
-                                if region:
-                                    if region not in self.region_index:
-                                        self.region_index[region] = []
-                                    self.region_index[region].append(cusip)
-                            
-                            # Add to exchange index if available
-                            if exchange_idx >= 0 and exchange_idx < len(row):
-                                exchange = row[exchange_idx]
-                                if exchange:
-                                    if exchange not in self.exchange_index:
-                                        self.exchange_index[exchange] = []
-                                    self.exchange_index[exchange].append(cusip)
-                            
-                            self.processed_rows += 1
-                    except UnicodeDecodeError:
-                        # Skip invalid UTF-8 sequences
-                        logger.warning(f"Skipped invalid UTF-8 sequence at position {mm.tell()}")
-                    except Exception as e:
-                        logger.warning(f"Error processing row: {e}")
-                    
-                    # Get next line
-                    line = mm.readline()
-                    
-                    # Trigger garbage collection if needed
-                    if self.processed_rows % self.config.index_buffer_count == 0:
-                        gc.collect()
-                
-                logger.info(f"Processed {self.processed_rows:,} rows from security master")
-                return True
+            processed = future.result()
+            with self.result_lock:
+                self.processed_rows += processed
+            logger.debug(f"Processed chunk with {processed} rows")
         except Exception as e:
-            logger.error(f"Error processing file with memory mapping: {e}")
-            return False
+            logger.error(f"Chunk processing failed: {str(e)}")
+
+    def is_file_loaded(self) -> bool:
+        """Return True if the security master was successfully loaded."""
+        return self._is_file_loaded
+
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Format the file size as a human-readable string."""
+        return self._format_bytes(size_bytes)
+
+    def _format_bytes(self, bytes_value: int) -> str:
+        """Convert bytes to a human-readable string."""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_value < 1024 or unit == 'TB':
+                return f"{bytes_value:.2f} {unit}"
+            bytes_value /= 1024
+
+    def get_security_dict(self, fields: List[str] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Return a lightweight dictionary snapshot of the security master data.
+        Currently, fields filtering is not implemented.
+        """
+        return self.indices.get_dict_snapshot()
     
-    def _process_with_reader(self) -> bool:
-        """Process security master using standard file reader."""
+def load_security_master_data(secmaster_path: str, 
+                             chunk_size_mb: int = DEFAULT_CHUNK_SIZE_MB, 
+                             use_mmap: bool = True,
+                             resource_monitor: Optional[ResourceMonitor] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Load and index the security master file in a memory-efficient way.
+    
+    Args:
+        secmaster_path: Path to security master CSV file
+        chunk_size_mb: Size of each chunk to process in MB
+        use_mmap: Whether to use memory mapping for file access
+        resource_monitor: Resource monitor instance for throttling
+        
+    Returns:
+        Dictionary of security master data indexed by CUSIP
+        
+    Raises:
+        FileNotFoundError: If security master file doesn't exist
+        ValueError: If security master file is invalid
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading security master from: {secmaster_path}")
+    
+    # Check if file exists
+    if not os.path.exists(secmaster_path):
+        logger.error(f"Security master file not found: {secmaster_path}")
+        raise FileNotFoundError(f"Security master file not found: {secmaster_path}")
+    
+    # Check file size
+    file_size = os.path.getsize(secmaster_path)
+    file_size_mb = file_size / (1024 * 1024)
+    logger.info(f"Security master file size: {file_size_mb:.2f} MB")
+    
+    # Fast path for small files (< 10MB)
+    if file_size_mb < 10:
+        logger.info("Using fast path for small security master file")
         try:
-            with open(self.file_path, 'r', newline='') as csvfile:
-                # Calculate chunk size in bytes
-                chunk_size = self.config.chunk_size_mb * 1024 * 1024
-                
-                # Parse header
-                reader = csv.reader(csvfile)
-                header_row = next(reader)
-                self.header = {field: i for i, field in enumerate(header_row)}
-                
-                # Check required fields
-                if 'CUSIP' not in self.header or 'Symbol' not in self.header:
-                    logger.error("Security master file missing required columns: CUSIP, Symbol")
-                    return False
-                
-                # Remember column indices for efficiency
-                cusip_idx = self.header['CUSIP']
-                symbol_idx = self.header['Symbol']
-                region_idx = self.header.get('Region', -1)
-                exchange_idx = self.header.get('Exchange', -1)
-                
-                # Init progress logging
-                last_log_time = time.time()
-                last_position = csvfile.tell()
-                
-                # Process the remaining rows
-                self.processed_rows = 0
-                
-                for row in reader:
-                    try:
-                        # Check if it's time to log progress
-                        current_time = time.time()
-                        if current_time - last_log_time > self.config.logging_interval:
-                            position = csvfile.tell()
-                            progress = (position / self.file_size) * 100
-                            speed = (position - last_position) / (current_time - last_log_time) / (1024 * 1024)
-                            logger.info(f"Processing: {progress:.1f}% complete, speed: {speed:.1f} MB/s, rows: {self.processed_rows:,}")
-                            last_log_time = current_time
-                            last_position = position
-                        
-                        # Process the row
-                        if len(row) >= len(self.header):
-                            cusip = row[cusip_idx]
-                            symbol = row[symbol_idx]
-                            
-                            if cusip and symbol:
-                                # Store position
-                                position = csvfile.tell()
-                                self.cusip_index[cusip] = position
-                                self.symbol_index[symbol] = cusip
-                                
-                                # Add to region index if available
-                                if region_idx >= 0 and region_idx < len(row):
-                                    region = row[region_idx]
-                                    if region:
-                                        if region not in self.region_index:
-                                            self.region_index[region] = []
-                                        self.region_index[region].append(cusip)
-                                
-                                # Add to exchange index if available
-                                if exchange_idx >= 0 and exchange_idx < len(row):
-                                    exchange = row[exchange_idx]
-                                    if exchange:
-                                        if exchange not in self.exchange_index:
-                                            self.exchange_index[exchange] = []
-                                        self.exchange_index[exchange].append(cusip)
-                            
-                            self.processed_rows += 1
-                    except Exception as e:
-                        logger.warning(f"Error processing row: {e}")
-                    
-                    # Trigger garbage collection if needed
-                    if self.processed_rows % self.config.index_buffer_count == 0:
-                        gc.collect()
-                
-                logger.info(f"Processed {self.processed_rows:,} rows from security master")
-                return True
+            return load_small_secmaster(secmaster_path)
         except Exception as e:
-            logger.error(f"Error processing file with reader: {e}")
-            return False
+            logger.error(f"Fast path failed, falling back to standard loader: {e}")
+            # Fall through to standard loading
     
-    def get_record_by_cusip(self, cusip: str) -> Optional[Dict[str, str]]:
-        """
-        Get a security record by CUSIP.
-        
-        Instead of keeping all records in memory, this fetches the specific
-        record from disk when needed.
-        
-        Args:
-            cusip: CUSIP identifier
-            
-        Returns:
-            Security record dictionary or None if not found
-        """
-        if not self.is_loaded or cusip not in self.cusip_index:
-            return None
-            
-        try:
-            position = self.cusip_index[cusip]
-            
-            # Read the record from the file
-            with open(self.file_path, 'r', newline='') as f:
-                f.seek(position)
-                line = f.readline().strip()
-                
-                # Parse the CSV line
-                values = next(csv.reader([line]))
-                
-                # Create dictionary
-                return {field: values[idx] for field, idx in self.header.items() 
-                        if idx < len(values)}
-                
-        except Exception as e:
-            logger.error(f"Error retrieving record by CUSIP: {e}")
-            return None
+    # Standard loading for larger files
+    # Log memory usage at start
+    process = psutil.Process(os.getpid())
+    start_memory = process.memory_info().rss
+    logger.info(f"Memory usage before loading: {start_memory / (1024**2):.1f} MB")
     
-    def get_symbol_by_cusip(self, cusip: str) -> Optional[str]:
-        """
-        Get the symbol for a given CUSIP.
-        
-        Args:
-            cusip: CUSIP identifier
-            
-        Returns:
-            Symbol string or None if not found
-        """
-        if not self.is_loaded or cusip not in self.cusip_index:
-            return None
-            
-        try:
-            record = self.get_record_by_cusip(cusip)
-            return record.get('Symbol') if record else None
-        except Exception as e:
-            logger.error(f"Error retrieving symbol by CUSIP: {e}")
-            return None
+    # Start loading timer
+    start_time = time.time()
     
-    def get_cusip_by_symbol(self, symbol: str) -> Optional[str]:
-        """
-        Get CUSIP by symbol.
+    # Load the security master with chunked loading
+    try:
+        # Call the factory function from security_master.py
+        sec_master = load_security_master(secmaster_path)
         
-        Args:
-            symbol: Security symbol
-            
-        Returns:
-            CUSIP string or None if not found
-        """
-        if not self.is_loaded:
-            return None
-            
-        return self.symbol_index.get(symbol)
+        if not sec_master.is_file_loaded():
+            logger.error(f"Failed to load security master from: {secmaster_path}")
+            raise ValueError(f"Failed to load security master from: {secmaster_path}")
+        
+        # Throttle if needed before getting security dict
+        if resource_monitor:
+            throttle_processing(resource_monitor)
+        
+        # Get a lightweight dictionary for the analyzer
+        # This specifically requests only the fields needed for analysis
+        security_data = sec_master.get_security_dict(fields=['Symbol', 'Region', 'Exchange'])
+        
+        # Log timing and memory stats
+        elapsed_time = time.time() - start_time
+        current_memory = process.memory_info().rss
+        memory_increase = current_memory - start_memory
+        
+        logger.info(f"Loaded {len(security_data)} securities in {elapsed_time:.2f} seconds")
+        logger.info(f"Memory usage after loading: {current_memory / (1024**2):.1f} MB " +
+                   f"(increase: {memory_increase / (1024**2):.1f} MB)")
+        
+        # Log some stats about the security master
+        regions = set(sec.get('Region', 'Unknown') for sec in security_data.values() if 'Region' in sec)
+        exchanges = set(sec.get('Exchange', 'Unknown') for sec in security_data.values() if 'Exchange' in sec)
+        
+        logger.info(f"Security master covers {len(regions)} regions and {len(exchanges)} exchanges")
+        
+        return security_data
     
-    def validate_symbol_cusip_pair(self, symbol: str, cusip: str) -> Tuple[bool, Optional[str]]:
-        """
-        Validate if a symbol matches the expected symbol for a CUSIP.
-        
-        Args:
-            symbol: Symbol to validate
-            cusip: CUSIP to check against
-            
-        Returns:
-            Tuple of (is_valid, expected_symbol)
-            - is_valid: True if symbol matches CUSIP, False otherwise
-            - expected_symbol: Expected symbol if different, None if match
-        """
-        if not self.is_loaded:
-            logger.warning("Attempted validation before security master was loaded")
-            return (False, None)
-            
-        expected_symbol = self.get_symbol_by_cusip(cusip)
-        
-        if not expected_symbol:
-            logger.warning(f"CUSIP {cusip} not found in security master")
-            return (False, None)
-            
-        if symbol == expected_symbol:
-            return (True, None)
-        else:
-            return (False, expected_symbol)
-    
-    def get_security_dict(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get a lightweight dictionary suitable for the analyzer.
-        
-        This creates a minimal representation needed by the analyzer
-        without loading all record details into memory.
-        
-        Returns:
-            Dictionary mapping CUSIPs to minimal security records
-        """
-        if not self.is_loaded:
-            logger.warning("Attempted to get security dict before security master was loaded")
-            return {}
-            
-        # Build a lightweight dictionary with just the Symbol (required) and any
-        # other fields that might be useful for grouping or display
-        security_dict = {}
-        essential_fields = ['Symbol', 'Region', 'Exchange']
-        
-        # Process each CUSIP in batches to manage memory
-        cusips = list(self.cusip_index.keys())
-        batch_size = min(10000, len(cusips))
-        
-        for i in range(0, len(cusips), batch_size):
-            batch = cusips[i:i+batch_size]
-            
-            for cusip in batch:
-                try:
-                    record = self.get_record_by_cusip(cusip)
-                    if record:
-                        # Extract just the essential fields
-                        security_dict[cusip] = {
-                            field: record.get(field, '') 
-                            for field in essential_fields 
-                            if field in self.header
-                        }
-                except Exception as e:
-                    logger.warning(f"Error retrieving record for CUSIP {cusip}: {e}")
-            
-            # Release memory after each batch
-            gc.collect()
-            
-        return security_dict
+    except Exception as e:
+        logger.error(f"Error loading security master: {e}")
+        raise
     
     def get_securities_by_region(self, region: str) -> List[Dict[str, Any]]:
         """
@@ -561,12 +564,17 @@ class ChunkedSecurityMasterLoader:
         Returns:
             List of security records in the region
         """
-        if not self.is_loaded:
+        if not self.is_file_loaded:
             logger.warning("Attempted lookup before security master was loaded")
             return []
             
-        cusips = self.region_index.get(region, [])
         result = []
+        
+        # Get CUSIPs for the region
+        cusips = []
+        with self.indices.locks['region']:
+            if region in self.indices.region_index:
+                cusips = self.indices.region_index[region].copy()
         
         # Process in batches to manage memory
         batch_size = 1000
@@ -585,11 +593,11 @@ class ChunkedSecurityMasterLoader:
     
     def get_security_count(self) -> int:
         """Return the total number of securities loaded."""
-        return len(self.cusip_index)
+        return self.indices.get_cusip_count()
     
     def is_file_loaded(self) -> bool:
         """Check if security master data has been loaded."""
-        return self.is_loaded
+        return self.is_file_loaded
     
     def _format_file_size(self, size_bytes: int) -> str:
         """Format file size as human-readable string."""
@@ -603,27 +611,36 @@ class ChunkedSecurityMasterLoader:
             bytes_value /= 1024
 
 
-def load_security_master(file_path: str) -> ChunkedSecurityMasterLoader:
+def load_security_master(file_path: str, thread_count: int = 3, chunk_size_mb: int = 64, 
+                        use_mmap: bool = True) -> ChunkedSecurityMasterLoader:
     """
     Factory function to create and load a ChunkedSecurityMasterLoader instance.
     
     Args:
         file_path: Path to the security master CSV file
+        thread_count: Number of threads to use for processing (default: 3)
+        chunk_size_mb: Size of each chunk in MB (default: 64)
+        use_mmap: Whether to use memory mapping for faster access (default: True)
         
     Returns:
         Loaded ChunkedSecurityMasterLoader instance
     """
     # Create config with reasonable defaults for production use
     config = SecurityMasterConfig(
-        chunk_size_mb=64,  # Process in 64MB chunks
+        chunk_size_mb=chunk_size_mb,
         index_buffer_count=1000000,  # Buffer 1M records before GC
-        monitor_memory=True,  # Enable memory monitoring
+        monitor_memory=True,
         memory_threshold_pct=85,  # Alert at 85% memory usage
-        max_retries=3,  # Retry up to 3 times on failure
-        enable_mmap=True,  # Use memory mapping for faster access
-        logging_interval=5  # Log progress every 5 seconds
+        max_retries=3,
+        enable_mmap=use_mmap,
+        logging_interval=5,  # Log progress every 5 seconds
+        thread_count=thread_count,
+        max_queue_size=thread_count * 2,  # Queue size based on thread count
+        cpu_threshold_pct=80,  # Throttle at 80% CPU usage
+        adaptative_threading=True  # Dynamically adjust thread count
     )
     
+    # Create and load the security master
     sec_master = ChunkedSecurityMasterLoader(config)
     success = sec_master.load(file_path)
     
@@ -644,37 +661,50 @@ if __name__ == "__main__":
     )
     
     # Create argument parser
-    parser = argparse.ArgumentParser(description="Chunked Security Master Loader")
+    parser = argparse.ArgumentParser(description="Multi-threaded Security Master Loader")
     parser.add_argument("file_path", help="Path to security master CSV file")
+    parser.add_argument("--threads", type=int, default=3, 
+                       help="Number of threads to use (default: 3)")
     parser.add_argument("--chunk-size", type=int, default=64, 
                        help="Chunk size in MB (default: 64)")
     parser.add_argument("--no-mmap", action="store_true", 
                        help="Disable memory mapping")
+    parser.add_argument("--static-threads", action="store_true",
+                       help="Disable adaptive threading")
     
     # Parse arguments
     args = parser.parse_args()
     
+    # Load security master with specified parameters
+    start_time = time.time()
+    
     # Create config
     config = SecurityMasterConfig(
         chunk_size_mb=args.chunk_size,
-        enable_mmap=not args.no_mmap
+        enable_mmap=not args.no_mmap,
+        thread_count=args.threads,
+        adaptative_threading=not args.static_threads
     )
     
     # Create and load security master
     loader = ChunkedSecurityMasterLoader(config)
     success = loader.load(args.file_path)
     
+    elapsed = time.time() - start_time
+    
     if success:
-        print(f"Successfully loaded {loader.get_security_count():,} securities")
+        print(f"Successfully loaded {loader.get_security_count():,} securities in {elapsed:.2f} seconds")
         
         # Print some sample lookups
         if loader.get_security_count() > 0:
-            cusips = list(loader.cusip_index.keys())
-            sample_cusip = cusips[0]
-            sample_record = loader.get_record_by_cusip(sample_cusip)
-            
-            print(f"\nSample record for CUSIP {sample_cusip}:")
-            for key, value in sample_record.items():
-                print(f"  {key}: {value}")
+            cusips = list(loader.indices.cusip_index.keys())
+            if cusips:
+                sample_cusip = cusips[0]
+                sample_record = loader.get_record_by_cusip(sample_cusip)
+                
+                print(f"\nSample record for CUSIP {sample_cusip}:")
+                if sample_record:
+                    for key, value in sample_record.items():
+                        print(f"  {key}: {value}")
     else:
-        print("Failed to load security master")
+        print(f"Failed to load security master after {elapsed:.2f} seconds")

@@ -1,0 +1,92 @@
+2025-03-17 19:09:46,686 - root - INFO - Auto-tuned performance settings based on 8 cores and 21.8GB available memory
+2025-03-17 19:09:46,687 - root - INFO - Configuration loaded from config.ini
+2025-03-17 19:09:46,689 - config - DEBUG - Python version: 3.13.2
+2025-03-17 19:09:46,689 - config - DEBUG - Host: DESKTOP-BC389GI
+2025-03-17 19:09:46,689 - config - DEBUG - CPU cores: 8
+2025-03-17 19:09:46,692 - config - DEBUG - Available memory: 21.77 GB
+2025-03-17 19:09:46,694 - __main__ - INFO - Performing pre-execution validation
+2025-03-17 19:09:46,703 - __main__ - INFO - Total input size: 0.12GB
+2025-03-17 19:09:46,703 - __main__ - INFO - System memory: 31.94GB
+2025-03-17 19:09:46,704 - __main__ - INFO - Free disk space: 119.73GB
+2025-03-17 19:09:46,704 - __main__ - INFO - Auto-calculated chunk size: 128MB
+2025-03-17 19:09:47,204 - __main__ - INFO - Loading security master from: ./data/sample/5gbSecMaster.csv
+2025-03-17 19:09:47,205 - __main__ - INFO - Security master file size: 119.17 MB
+2025-03-17 19:09:47,206 - __main__ - INFO - Memory usage before loading: 65.1 MB
+2025-03-17 19:09:47,207 - security_master - INFO - Loading security master from ./data/sample/5gbSecMaster.csv (119.17 MB)
+2025-03-17 19:09:47,334 - security_master - INFO - Adjusting optimal thread count from 3 to 4 (CPU: 31.2%, Memory: 0.2%)
+2025-03-17 19:10:04,391 - security_master - DEBUG - Processed chunk with 812312 rows
+2025-03-17 19:10:06,868 - security_master - DEBUG - Processed chunk with 1342558 rows
+2025-03-17 19:10:06,983 - security_master - INFO - Successfully loaded 2,154,870 securities
+2025-03-17 19:16:10,450 - root - WARNING - Critical resource usage: CPU 87.5%, Memory 35.8%
+2025-03-17 19:16:10,626 - root - WARNING - CPU usage high: 87.5%, throttling enabled
+2025-03-17 19:16:35,501 - __main__ - INFO - FIX Symbol Discrepancy Checker completed
+2025-03-17 19:46:11,006 - root - INFO - Auto-tuned performance settings based on 8 cores and 21.8GB available memory
+2025-03-17 19:46:11,007 - root - INFO - Configuration loaded from config.ini
+2025-03-17 19:46:11,009 - config - DEBUG - Python version: 3.13.2
+2025-03-17 19:46:11,009 - config - DEBUG - Host: DESKTOP-BC389GI
+2025-03-17 19:46:11,010 - config - DEBUG - CPU cores: 8
+2025-03-17 19:46:11,013 - config - DEBUG - Available memory: 21.79 GB
+2025-03-17 19:46:11,015 - __main__ - INFO - Performing pre-execution validation
+2025-03-17 19:46:11,015 - __main__ - ERROR - Security master validation failed: File not found: ./data/sample/5gbSecMaster.csv
+2025-03-17 19:46:11,015 - __main__ - ERROR - Pre-execution validation failed. Aborting.
+2025-03-17 19:46:12,141 - __main__ - INFO - FIX Symbol Discrepancy Checker completed
+2025-03-17 19:48:54,624 - root - INFO - Auto-tuned performance settings based on 8 cores and 21.8GB available memory
+2025-03-17 19:48:54,625 - root - INFO - Configuration loaded from config.ini
+2025-03-17 19:48:54,627 - config - DEBUG - Python version: 3.13.2
+2025-03-17 19:48:54,627 - config - DEBUG - Host: DESKTOP-BC389GI
+2025-03-17 19:48:54,627 - config - DEBUG - CPU cores: 8
+2025-03-17 19:48:54,630 - config - DEBUG - Available memory: 21.80 GB
+2025-03-17 19:48:54,632 - __main__ - INFO - Performing pre-execution validation
+2025-03-17 19:48:54,641 - __main__ - INFO - Total input size: 0.12GB
+2025-03-17 19:48:54,641 - __main__ - INFO - System memory: 31.94GB
+2025-03-17 19:48:54,641 - __main__ - INFO - Free disk space: 119.61GB
+2025-03-17 19:48:54,642 - __main__ - INFO - Auto-calculated chunk size: 128MB
+2025-03-17 19:48:55,142 - __main__ - INFO - Loading security master from: ./122MB_SecMaster.csv
+2025-03-17 19:48:55,143 - __main__ - INFO - Security master file size: 119.17 MB
+2025-03-17 19:48:55,143 - __main__ - INFO - Memory usage before loading: 64.9 MB
+2025-03-17 19:48:55,144 - security_master - INFO - Loading security master from ./122MB_SecMaster.csv (119.17 MB)
+2025-03-17 19:48:55,269 - security_master - INFO - Adjusting optimal thread count from 3 to 4 (CPU: 37.9%, Memory: 0.2%)
+2025-03-17 19:49:11,870 - security_master - DEBUG - Processed chunk with 812312 rows
+2025-03-17 19:49:14,274 - security_master - DEBUG - Processed chunk with 1342558 rows
+2025-03-17 19:49:14,393 - security_master - INFO - Successfully loaded 2,154,870 securities
+2025-03-17 19:54:16,846 - root - INFO - Auto-tuned performance settings based on 8 cores and 21.8GB available memory
+2025-03-17 19:54:16,847 - root - INFO - Configuration loaded from config.ini
+2025-03-17 19:54:16,849 - config - DEBUG - Python version: 3.13.2
+2025-03-17 19:54:16,850 - config - DEBUG - Host: DESKTOP-BC389GI
+2025-03-17 19:54:16,850 - config - DEBUG - CPU cores: 8
+2025-03-17 19:54:16,853 - config - DEBUG - Available memory: 21.81 GB
+2025-03-17 19:54:16,855 - __main__ - INFO - Performing pre-execution validation
+2025-03-17 19:54:16,865 - __main__ - INFO - Total input size: 0.12GB
+2025-03-17 19:54:16,866 - __main__ - INFO - System memory: 31.94GB
+2025-03-17 19:54:16,866 - __main__ - INFO - Free disk space: 119.61GB
+2025-03-17 19:54:16,866 - __main__ - INFO - Auto-calculated chunk size: 128MB
+2025-03-17 19:54:17,367 - __main__ - INFO - Loading security master from: ./122MB_SecMaster.csv
+2025-03-17 19:54:17,367 - __main__ - INFO - Security master file size: 119.17 MB
+2025-03-17 19:54:17,368 - __main__ - INFO - Memory usage before loading: 64.9 MB
+2025-03-17 19:54:17,368 - security_master - INFO - Loading security master from ./122MB_SecMaster.csv (119.17 MB)
+2025-03-17 19:54:17,486 - security_master - INFO - Adjusting optimal thread count from 3 to 4 (CPU: 18.8%, Memory: 0.2%)
+2025-03-17 19:54:31,306 - security_master - INFO - Adjusting optimal thread count from 4 to 3 (CPU: 53.1%, Memory: 4.3%)
+2025-03-17 19:54:32,411 - security_master - INFO - Adjusting optimal thread count from 3 to 4 (CPU: 21.2%, Memory: 4.3%)
+2025-03-17 19:54:34,345 - security_master - DEBUG - Processed chunk with 812312 rows
+2025-03-17 19:54:36,815 - security_master - DEBUG - Processed chunk with 1342558 rows
+2025-03-17 19:54:36,934 - security_master - INFO - Successfully loaded 2,154,870 securities
+2025-03-17 19:55:30,344 - root - INFO - Auto-tuned performance settings based on 8 cores and 21.8GB available memory
+2025-03-17 19:55:30,345 - root - INFO - Configuration loaded from config.ini
+2025-03-17 19:55:30,347 - config - DEBUG - Python version: 3.13.2
+2025-03-17 19:55:30,347 - config - DEBUG - Host: DESKTOP-BC389GI
+2025-03-17 19:55:30,348 - config - DEBUG - CPU cores: 8
+2025-03-17 19:55:30,351 - config - DEBUG - Available memory: 21.82 GB
+2025-03-17 19:55:30,353 - __main__ - INFO - Performing pre-execution validation
+2025-03-17 19:55:30,361 - __main__ - INFO - Total input size: 0.12GB
+2025-03-17 19:55:30,362 - __main__ - INFO - System memory: 31.94GB
+2025-03-17 19:55:30,362 - __main__ - INFO - Free disk space: 119.61GB
+2025-03-17 19:55:30,362 - __main__ - INFO - Auto-calculated chunk size: 128MB
+2025-03-17 19:55:30,862 - __main__ - INFO - Loading security master from: ./122MB_SecMaster.csv
+2025-03-17 19:55:30,863 - __main__ - INFO - Security master file size: 119.17 MB
+2025-03-17 19:55:30,864 - __main__ - INFO - Memory usage before loading: 65.0 MB
+2025-03-17 19:55:30,865 - security_master - INFO - Loading security master from ./122MB_SecMaster.csv (119.17 MB)
+2025-03-17 19:55:30,994 - security_master - INFO - Adjusting optimal thread count from 3 to 4 (CPU: 17.2%, Memory: 0.2%)
+2025-03-17 19:55:47,635 - security_master - DEBUG - Processed chunk with 812312 rows
+2025-03-17 19:55:50,054 - security_master - DEBUG - Processed chunk with 1342558 rows
+2025-03-17 19:55:50,168 - security_master - INFO - Successfully loaded 2,154,870 securities
+2025-03-17 19:59:05,863 - root - WARNING - CPU usage high: 84.2%, throttling enabled
