@@ -289,28 +289,66 @@ class ThreadSafeIndices:
             return list(self.exchange_index.keys())
             
     def get_dict_snapshot(self) -> Dict[str, Dict[str, Any]]:
-        """Get a snapshot of the data for the analyzer."""
+        """Get a snapshot of the data for the analyzer with optimized performance."""
+        logger.debug("Starting get_dict_snapshot")
         result = {}
-        with self.locks['cusip'], self.locks['symbol'], self.locks['region'], self.locks['exchange']:
-            for cusip in self.cusip_index.keys():
+        
+        try:
+            # Get copies of data under individual locks
+            with self.locks['cusip']:
+                cusip_data = self.cusip_index.copy()
+                logger.debug(f"Copied {len(cusip_data)} CUSIPs")
+            
+            with self.locks['symbol']:
+                symbol_map = self.symbol_index.copy()
+                logger.debug(f"Copied {len(symbol_map)} symbols")
+                
+            with self.locks['region']:
+                region_map = {k: list(v) for k, v in self.region_index.items()}
+                logger.debug(f"Copied {len(region_map)} regions")
+                
+            with self.locks['exchange']:
+                exchange_map = {k: list(v) for k, v in self.exchange_index.items()}
+                logger.debug(f"Copied {len(exchange_map)} exchanges")
+            
+            # Create reverse lookup dictionaries (O(n) operations)
+            logger.debug("Creating reverse lookup maps")
+            cusip_to_symbol = {}
+            for symbol, cusip in symbol_map.items():
+                cusip_to_symbol[cusip] = symbol
+            
+            cusip_to_region = {}
+            for region, cusips in region_map.items():
+                for cusip in cusips:
+                    cusip_to_region[cusip] = region
+            
+            cusip_to_exchange = {}
+            for exchange, cusips in exchange_map.items():
+                for cusip in cusips:
+                    cusip_to_exchange[cusip] = exchange
+            
+            # Build result dictionary with O(1) lookups instead of nested loops
+            logger.debug("Building result dictionary with optimized lookups")
+            for cusip in cusip_data:
                 result[cusip] = {}
-                # Add symbol if available
-                for symbol, c in self.symbol_index.items():
-                    if c == cusip:
-                        result[cusip]['Symbol'] = symbol
-                        break
-                # Add region if available
-                for region, cusips in self.region_index.items():
-                    if cusip in cusips:
-                        result[cusip]['Region'] = region
-                        break
-                # Add exchange if available
-                for exchange, cusips in self.exchange_index.items():
-                    if cusip in cusips:
-                        result[cusip]['Exchange'] = exchange
-                        break
+                
+                # Direct lookups using reverse maps
+                if cusip in cusip_to_symbol:
+                    result[cusip]['Symbol'] = cusip_to_symbol[cusip]
+                
+                if cusip in cusip_to_region:
+                    result[cusip]['Region'] = cusip_to_region[cusip]
+                    
+                if cusip in cusip_to_exchange:
+                    result[cusip]['Exchange'] = cusip_to_exchange[cusip]
+                
+            logger.debug(f"Result dictionary built with {len(result)} entries")
+            
+        except Exception as e:
+            logger.error(f"Error building security dictionary: {e}", exc_info=True)
+            return {}
+        
         return result
-
 
 class ChunkedSecurityMasterLoader:
     def __init__(self, config: Optional[SecurityMasterConfig] = None):
@@ -328,6 +366,57 @@ class ChunkedSecurityMasterLoader:
         self.job_queue = Queue(maxsize=self.config.max_queue_size)
         self.result_lock = threading.Lock()
         self.file = None  # Add file handle reference
+        self.tasks_completed = 0
+        self.tasks_submitted = 0
+        self.all_tasks_completed = threading.Event()
+
+    def get_security_count(self) -> int:
+        """Return the total number of securities loaded."""
+        return len(self.indices.cusip_index)
+
+    def _process_chunk(self, chunk: List[List[str]]):
+        """Process a chunk of CSV rows."""
+        processed = 0
+        for row in chunk:
+            try:
+                # Skip if row doesn't have enough fields
+                if len(row) < len(self.header):
+                    continue
+                    
+                # Extract key fields
+                cusip_idx = self.header.get('CUSIP', -1)
+                symbol_idx = self.header.get('Symbol', -1)
+                region_idx = self.header.get('Region', -1) 
+                exchange_idx = self.header.get('Exchange', -1)
+                
+                # Skip if essential indices are missing
+                if cusip_idx < 0 or symbol_idx < 0:
+                    continue
+                    
+                cusip = row[cusip_idx]
+                symbol = row[symbol_idx]
+                
+                # Store in indices
+                self.indices.add_cusip(cusip, processed)  # Using row position as placeholder
+                self.indices.add_symbol(symbol, cusip)
+                
+                # Add region if available
+                if region_idx >= 0 and region_idx < len(row):
+                    region = row[region_idx]
+                    if region:
+                        self.indices.add_region(region, cusip)
+                
+                # Add exchange if available
+                if exchange_idx >= 0 and exchange_idx < len(row):
+                    exchange = row[exchange_idx]
+                    if exchange:
+                        self.indices.add_exchange(exchange, cusip)
+                        
+                processed += 1
+            except Exception as e:
+                logger.warning(f"Error processing row: {e}")
+                
+        return processed
 
     def load(self, file_path: str) -> bool:
         """Main entry point for loading the security master file."""
@@ -388,6 +477,11 @@ class ChunkedSecurityMasterLoader:
 
                 # Wait for completion
                 self.thread_pool.shutdown(wait=True)
+                logger.info("Thread pool shutdown complete")
+                logger.info(f"Tasks submitted: {self.tasks_submitted}, completed: {self.tasks_completed}")
+                gc.collect()
+                logger.info("Garbage collection after thread pool shutdown")
+                self.all_tasks_completed.wait(timeout=30)
 
             success = True
             logger.info(f"Successfully loaded {self.indices.get_cusip_count():,} securities")
@@ -405,43 +499,59 @@ class ChunkedSecurityMasterLoader:
             print ("garbage tossed")
 
         self._is_file_loaded = success
+        logger.info("About to return from security_master.load() method with success: %s", success)
         return success
 
     def _submit_chunk(self, chunk: List[List[str]]):
         """Submit a chunk for processing to the thread pool."""
+        self.tasks_submitted += 1
         future = self.thread_pool.submit(self._process_chunk, chunk)
         future.add_done_callback(self._handle_result)
 
-    def _process_chunk(self, chunk: List[List[str]]):
-        """Process a chunk of CSV rows."""
-        processed = 0
-        for row in chunk:
-            try:
-                cusip = row[self.header['CUSIP']]
-                symbol = row[self.header['Symbol']]
-                region = row[self.header['Region']]
-                exchange = row[self.header['Exchange']]
-
-                with self.result_lock:
-                    self.indices.add_cusip(cusip, self.file.tell())
-                    self.indices.add_symbol(symbol, cusip)
-                    self.indices.add_region(region, cusip)
-                    self.indices.add_exchange(exchange, cusip)
-
-                processed += 1
-            except Exception as e:
-                logger.warning(f"Invalid row: {str(e)}")
-        return processed
-
+    # Update _handle_result to signal completion:
     def _handle_result(self, future):
-        """Handle completion of a chunk processing task."""
         try:
             processed = future.result()
             with self.result_lock:
                 self.processed_rows += processed
+                self.tasks_completed += 1
+                if self.tasks_completed >= self.tasks_submitted:
+                    self.all_tasks_completed.set()
             logger.debug(f"Processed chunk with {processed} rows")
         except Exception as e:
             logger.error(f"Chunk processing failed: {str(e)}")
+
+
+        def _process_chunk(self, chunk: List[List[str]]):
+            """Process a chunk of CSV rows."""
+            processed = 0
+            for row in chunk:
+                try:
+                    cusip = row[self.header['CUSIP']]
+                    symbol = row[self.header['Symbol']]
+                    region = row[self.header['Region']]
+                    exchange = row[self.header['Exchange']]
+
+                    with self.result_lock:
+                        self.indices.add_cusip(cusip, self.file.tell())
+                        self.indices.add_symbol(symbol, cusip)
+                        self.indices.add_region(region, cusip)
+                        self.indices.add_exchange(exchange, cusip)
+
+                    processed += 1
+                except Exception as e:
+                    logger.warning(f"Invalid row: {str(e)}")
+            return processed
+
+        def _handle_result(self, future):
+            """Handle completion of a chunk processing task."""
+            try:
+                processed = future.result()
+                with self.result_lock:
+                    self.processed_rows += processed
+                logger.debug(f"Processed chunk with {processed} rows")
+            except Exception as e:
+                logger.error(f"Chunk processing failed: {str(e)}")
 
     def is_file_loaded(self) -> bool:
         """Return True if the security master was successfully loaded."""
@@ -459,11 +569,15 @@ class ChunkedSecurityMasterLoader:
             bytes_value /= 1024
 
     def get_security_dict(self, fields: List[str] = None) -> Dict[str, Dict[str, Any]]:
-        """
-        Return a lightweight dictionary snapshot of the security master data.
-        Currently, fields filtering is not implemented.
-        """
-        return self.indices.get_dict_snapshot()
+        """Return a lightweight dictionary snapshot of the security master data."""
+        logger.info("Starting get_security_dict method")
+        try:
+            result = self.indices.get_dict_snapshot()
+            logger.info(f"Completed get_security_dict, returning {len(result)} records")
+            return result
+        except Exception as e:
+            logger.error(f"Error in get_security_dict: {e}", exc_info=True)
+            return {}
     
 def load_security_master_data(secmaster_path: str, 
                              chunk_size_mb: int = DEFAULT_CHUNK_SIZE_MB, 
