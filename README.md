@@ -6,7 +6,8 @@ Start TIME: 14:30 (Friday)
 End Time:
 
 ## Overview
-This tool identifies discrepancies between FIX message symbols and the security master database, with focus on detecting corporate action-related symbol changes that weren't properly updated in trading systems.
+This tool identifies discrepancies between FIX message symbols and the security master database, with focus on detecting corporate action-related
+symbol changes that weren't properly updated in trading systems. This was build as a demo during DE Shaw interview process.
 
 ## Features
 - Parses FIX 4.2 protocol messages (NewOrderSingle and ExecReport)
@@ -16,7 +17,7 @@ This tool identifies discrepancies between FIX message symbols and the security 
 - Generates CSV reports for operations teams
 
 ## Implementation Notes
-This project was implemented with a 12-hour turnaround goal to demonstrate rapid problem-solving skills. Some compromises were made to prioritize core functionality:
+This project was implemented with a rapid turnaround goal to demonstrate rapid problem-solving skills. Some compromises were made to prioritize core functionality:
 
 - Testing is minimal (would add pytest coverage in production)
 - Error handling focuses on critical paths only
